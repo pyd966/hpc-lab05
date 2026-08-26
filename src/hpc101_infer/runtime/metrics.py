@@ -29,6 +29,7 @@ def measure_operation(device: torch.device, synchronize_cuda: bool):
     try:
         yield metrics
     finally:
+        # 不要从 finally 返回，否则 contextmanager 会吞掉前向异常。
         metrics.latency_s = perf_counter() - start
         if device.type == "cuda":
             metrics.peak_allocated_bytes = torch.cuda.max_memory_allocated(device)
@@ -36,4 +37,3 @@ def measure_operation(device: torch.device, synchronize_cuda: bool):
         else:
             metrics.peak_allocated_bytes = 0
             metrics.peak_reserved_bytes = 0
-        return metrics

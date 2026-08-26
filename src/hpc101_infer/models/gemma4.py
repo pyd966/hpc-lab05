@@ -12,6 +12,7 @@ from hpc101_infer.layers.norm import RMSNorm
 from hpc101_infer.models.config import Gemma4TextConfig
 from hpc101_infer.runtime.batch import Batch
 from hpc101_infer.runtime.kv_cache import KVCache
+from hpc101_infer.runtime.offloading import AsyncLayerOffloader
 
 
 class MLP(nn.Module):
@@ -147,6 +148,30 @@ class Gemma4ForCausalLM(nn.Module):
         )
         self.norm = RMSNorm(config.hidden_size, config.rms_norm_eps)
         self.embed_scale = math.sqrt(config.hidden_size)
+        self._offloader: AsyncLayerOffloader | None = None
+        self._offload_prefetch = True
+
+    def enable_async_weight_offloading(
+        self,
+        device: str | torch.device,
+        *,
+        prefetch: bool = True,
+        pin_memory: bool = True,
+    ) -> None:
+        """将 decoder layers 保留在 pinned CPU，并启用异步 GPU 预取。"""
+        if self._offloader is not None:
+            raise RuntimeError("weight offloading is already enabled")
+        device = torch.device(device)
+        if device.type != "cuda":
+            raise ValueError("weight offloading requires a CUDA device")
+        self.embed_tokens.to(device=device)
+        self.norm.to(device=device)
+        self._offloader = AsyncLayerOffloader(
+            self.layers,
+            device,
+            pin_memory=pin_memory,
+        )
+        self._offload_prefetch = prefetch
 
     def forward(
         self,
@@ -178,10 +203,33 @@ class Gemma4ForCausalLM(nn.Module):
             device=input_ids.device,
             dtype=self.embed_tokens.weight.dtype,
         )
-        for layer in self.layers:
-            hidden_states = layer(
-                hidden_states, position_ids, sequence_lengths, max_seq_len, kv_cache
-            )
+        offloader = self._offloader
+        if offloader is None:
+            for layer in self.layers:
+                hidden_states = layer(
+                    hidden_states,
+                    position_ids,
+                    sequence_lengths,
+                    max_seq_len,
+                    kv_cache,
+                )
+        else:
+            offloader.prefetch(0)
+            for layer_index, layer in enumerate(self.layers):
+                offloader.wait(layer_index)
+                next_index = layer_index + 1
+                if self._offload_prefetch and next_index < len(self.layers):
+                    offloader.prefetch(next_index)
+                hidden_states = layer(
+                    hidden_states,
+                    position_ids,
+                    sequence_lengths,
+                    max_seq_len,
+                    kv_cache,
+                )
+                offloader.release(layer_index)
+                if not self._offload_prefetch and next_index < len(self.layers):
+                    offloader.prefetch(next_index)
         if kv_cache is not None:
             kv_cache.commit(sequence_lengths)
         hidden_states = self.norm(hidden_states)

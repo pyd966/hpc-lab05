@@ -37,12 +37,19 @@ class InferenceEngine:
         self.config = config
         self.tokenizer = tokenizer
         self.device = torch.device(config.device)
-        first_parameter = next(model.parameters())
-        if (
-            first_parameter.device != self.device
-            or first_parameter.dtype != config.dtype
-        ):
-            model = model.to(device=self.device, dtype=config.dtype)
+        if config.weight_offloading:
+            model.enable_async_weight_offloading(
+                self.device,
+                prefetch=config.weight_offloading_prefetch,
+                pin_memory=config.weight_offloading_pin_memory,
+            )
+        else:
+            first_parameter = next(model.parameters())
+            if (
+                first_parameter.device != self.device
+                or first_parameter.dtype != config.dtype
+            ):
+                model = model.to(device=self.device, dtype=config.dtype)
         self.model = model.eval()
         self.cache = KVCache.allocate(
             model.config,
@@ -63,7 +70,7 @@ class InferenceEngine:
 
         model = load_gemma4(
             model_path,
-            device=config.device,
+            device="cpu" if config.weight_offloading else config.device,
             dtype=config.dtype,
             max_position_embeddings=config.max_sequence_length,
             linear_backend=config.linear_backend,

@@ -8,6 +8,9 @@ engine:
   scheduler_backend: static_batch
   seed: 42
   synchronize_metrics: true
+  weight_offloading: true
+  weight_offloading_prefetch: true
+  weight_offloading_pin_memory: true
 
 quantization:
   algorithm: gptq

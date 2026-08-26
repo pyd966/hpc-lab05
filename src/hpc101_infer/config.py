@@ -82,6 +82,9 @@ class EngineConfig:
     scheduler_backend: str = "static_batch"
     seed: int = 0
     synchronize_metrics: bool = True
+    weight_offloading: bool = False
+    weight_offloading_prefetch: bool = True
+    weight_offloading_pin_memory: bool = True
 
     @classmethod
     def from_mapping(cls, raw: Mapping[str, object]) -> EngineConfig:
@@ -126,6 +129,15 @@ class EngineConfig:
         )
         if synchronize_metrics is not None:
             values["synchronize_metrics"] = synchronize_metrics
+
+        for key in (
+            "weight_offloading",
+            "weight_offloading_prefetch",
+            "weight_offloading_pin_memory",
+        ):
+            value = _optional_boolean(raw.get(key), f"config.engine.{key}")
+            if value is not None:
+                values[key] = value
 
         if "scheduler_batch_size" in values and "max_batch_size" not in values:
             values["max_batch_size"] = values["scheduler_batch_size"]
