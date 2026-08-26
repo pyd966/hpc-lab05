@@ -1,27 +1,27 @@
 {
   "schema_version": 2,
-  "model": "gemma-4-12b-gptq",
+  "model": "gemma-4-12b-gptq-group64",
   "linear_backend": "int4_reference",
   "dataset": "datasets/quality_public.jsonl",
   "dataset_sha256": "61f9a48a4b7ee0c0bf9cb415cbcf257ee0d18666787b58dc21f25abdfc99290f",
   "chunk_size": 128,
   "bucket_lengths": [128, 256, 512, 1024, 2048],
-  "nll_sum": 49603.35574189418,
+  "nll_sum": 48901.84273028943,
   "token_count": 20418,
   "sequence_count": 62,
-  "mean_nll": 2.4293934637033097,
-  "perplexity": 11.351994594696176,
+  "mean_nll": 2.395035886486895,
+  "perplexity": 10.968591676239054,
   "by_bucket": {
-    "128": {"nll_sum": 12530.016155270183, "token_count": 4064, "sequence_count": 32, "mean_nll": 3.0831732665527025, "perplexity": 21.827557272158323, "reference_mean_nll": 2.945143927673276, "delta_nll": 0.1380293388794267, "perplexity_ratio": 1.1480092310845091},
-    "256": {"nll_sum": 10405.129003500086, "token_count": 4080, "sequence_count": 16, "mean_nll": 2.5502767165441385, "perplexity": 12.810648210540492, "reference_mean_nll": 2.430436479992495, "delta_nll": 0.11984023655164355, "perplexity_ratio": 1.1273167331829075},
-    "512": {"nll_sum": 9933.590018999908, "token_count": 4088, "sequence_count": 8, "mean_nll": 2.4299388500489014, "perplexity": 11.358187506154525, "reference_mean_nll": 2.3247355590035936, "delta_nll": 0.10520329104530779, "perplexity_ratio": 1.1109364308295813},
-    "1024": {"nll_sum": 8334.348271030145, "token_count": 4092, "sequence_count": 4, "mean_nll": 2.0367420017180216, "perplexity": 7.665593979220128, "reference_mean_nll": 1.90839071657943, "delta_nll": 0.1283512851385915, "perplexity_ratio": 1.1369523270103712},
-    "2048": {"nll_sum": 8400.27229309385, "token_count": 4094, "sequence_count": 2, "mean_nll": 2.0518496074972767, "perplexity": 7.782281969807774, "reference_mean_nll": 1.9384820409680328, "delta_nll": 0.11336756652924396, "perplexity_ratio": 1.1200435478155004}
+    "128": {"nll_sum": 12327.571057349262, "token_count": 4064, "sequence_count": 32, "mean_nll": 3.0333590200170426, "perplexity": 20.766871902399394, "reference_mean_nll": 2.945143927673276, "delta_nll": 0.08821509234376679, "perplexity_ratio": 1.0922230255748016},
+    "256": {"nll_sum": 10170.59063362392, "token_count": 4080, "sequence_count": 16, "mean_nll": 2.492791821966647, "perplexity": 12.094996104257449, "reference_mean_nll": 2.430436479992495, "delta_nll": 0.06235534197415227, "perplexity_ratio": 1.0643404823881455},
+    "512": {"nll_sum": 9770.400501920667, "token_count": 4088, "sequence_count": 8, "mean_nll": 2.3900196922506525, "perplexity": 10.913708856416251, "reference_mean_nll": 2.3247355590035936, "delta_nll": 0.06528413324705884, "perplexity_ratio": 1.0674622828237814},
+    "1024": {"nll_sum": 8376.685341571467, "token_count": 4092, "sequence_count": 4, "mean_nll": 2.047088304391854, "perplexity": 7.74531623885686, "reference_mean_nll": 1.90839071657943, "delta_nll": 0.13869758781242392, "perplexity_ratio": 1.1487766434109288},
+    "2048": {"nll_sum": 8256.59519582411, "token_count": 4094, "sequence_count": 2, "mean_nll": 2.0167550551597726, "perplexity": 7.513903130196502, "reference_mean_nll": 1.9384820409680328, "delta_nll": 0.07827301419173982, "perplexity_ratio": 1.0814178607942626}
   },
   "reference": "results/bf16-public-quality.json",
   "reference_mean_nll": 2.3084555301012055,
-  "delta_nll": 0.12093793360210414,
-  "perplexity_ratio": 1.1285548648582786,
+  "delta_nll": 0.0865803563856895,
+  "perplexity_ratio": 1.0904389879331955,
   "max_delta_nll": 0.16,
   "passed": true
 }
