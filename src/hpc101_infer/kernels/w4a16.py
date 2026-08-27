@@ -6,6 +6,8 @@ import torch
 import triton
 import triton.language as tl
 
+from hpc101_infer.quantization.packing import W4A16_K_BLOCK, W4A16_N_BLOCK
+
 
 @triton.jit
 def _w4a16_gemm_kernel(
@@ -18,12 +20,9 @@ def _w4a16_gemm_kernel(
     m_size,
     n_size,
     k_size,
+    n_blocks,
     stride_am,
     stride_ak,
-    stride_qn,
-    stride_qk,
-    stride_sn,
-    stride_sk,
     stride_om,
     stride_on,
     GROUP_SIZE: tl.constexpr,
@@ -33,14 +32,24 @@ def _w4a16_gemm_kernel(
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
+    GROUP_M: tl.constexpr,
+    LAYOUT_K_BLOCK: tl.constexpr,
+    LAYOUT_N_BLOCK: tl.constexpr,
 ):
     program_id = tl.program_id(0)
+    programs_m = tl.cdiv(m_size, BLOCK_M)
     programs_n = tl.cdiv(n_size, BLOCK_N)
-    program_m = program_id // programs_n
-    program_n = program_id % programs_n
+    programs_per_group = GROUP_M * programs_n
+    group_id = program_id // programs_per_group
+    first_program_m = group_id * GROUP_M
+    group_m = tl.minimum(programs_m - first_program_m, GROUP_M)
+    program_in_group = program_id % programs_per_group
+    program_m = first_program_m + (program_in_group % group_m)
+    program_n = program_in_group // group_m
 
     offsets_m = program_m * BLOCK_M + tl.arange(0, BLOCK_M)
     offsets_n = program_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offsets_n = tl.max_contiguous(offsets_n, BLOCK_N)
     accumulator = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
 
     for k_start in range(0, k_size, BLOCK_K):
@@ -54,10 +63,16 @@ def _w4a16_gemm_kernel(
             other=0.0,
         )
 
+        packed_offsets = (
+            (
+                (offsets_k[:, None] // LAYOUT_K_BLOCK) * n_blocks
+                + offsets_n[None, :] // LAYOUT_N_BLOCK
+            )
+            * (LAYOUT_K_BLOCK // 2)
+            + (offsets_k[:, None] % LAYOUT_K_BLOCK) // 2
+        ) * LAYOUT_N_BLOCK + offsets_n[None, :] % LAYOUT_N_BLOCK
         packed = tl.load(
-            qweight_ptr
-            + offsets_n[None, :] * stride_qn
-            + (offsets_k[:, None] // 2) * stride_qk,
+            qweight_ptr + packed_offsets,
             mask=(offsets_k[:, None] < k_size)
             & (offsets_n[None, :] < n_size),
             other=0,
@@ -65,28 +80,47 @@ def _w4a16_gemm_kernel(
         shifts = ((offsets_k & 1) * 4)[:, None]
         codes = (packed >> shifts) & 0x0F
 
-        group_indices = offsets_k // GROUP_SIZE
-        scale_values = tl.load(
-            scales_ptr
-            + offsets_n[None, :] * stride_sn
-            + group_indices[:, None] * stride_sk,
-            mask=(offsets_k[:, None] < k_size)
-            & (offsets_n[None, :] < n_size),
-            other=0.0,
-        ).to(tl.float32)
-        if HAS_ZEROS:
-            zero_values = tl.load(
-                zeros_ptr
-                + offsets_n[None, :] * stride_sn
-                + group_indices[:, None] * stride_sk,
+        if GROUP_SIZE == BLOCK_K:
+            group_index = k_start // GROUP_SIZE
+            group_offsets = group_index * n_blocks * LAYOUT_N_BLOCK + offsets_n
+            scale_values = tl.load(
+                scales_ptr + group_offsets,
+                mask=offsets_n < n_size,
+                other=0.0,
+            ).to(tl.float32)
+            if HAS_ZEROS:
+                zero_values = tl.load(
+                    zeros_ptr + group_offsets,
+                    mask=offsets_n < n_size,
+                    other=0,
+                ).to(tl.float32)
+            else:
+                zero_values = 8.0
+            weight_values = (
+                codes.to(tl.float32) - zero_values
+            ) * scale_values
+        else:
+            group_indices = offsets_k // GROUP_SIZE
+            group_offsets = (
+                group_indices[:, None] * n_blocks * LAYOUT_N_BLOCK
+                + offsets_n[None, :]
+            )
+            scale_values = tl.load(
+                scales_ptr + group_offsets,
                 mask=(offsets_k[:, None] < k_size)
                 & (offsets_n[None, :] < n_size),
-                other=0,
+                other=0.0,
             ).to(tl.float32)
-        else:
-            zero_values = 8.0
-
-        weight_values = (codes.to(tl.float32) - zero_values) * scale_values
+            if HAS_ZEROS:
+                zero_values = tl.load(
+                    zeros_ptr + group_offsets,
+                    mask=(offsets_k[:, None] < k_size)
+                    & (offsets_n[None, :] < n_size),
+                    other=0,
+                ).to(tl.float32)
+            else:
+                zero_values = 8.0
+            weight_values = (codes.to(tl.float32) - zero_values) * scale_values
         if INPUT_BF16:
             weight_values = weight_values.to(tl.bfloat16)
         else:
@@ -111,12 +145,16 @@ def _w4a16_gemm_kernel(
     )
 
 
-def _launch_config(m_size: int) -> tuple[int, int, int, int, int]:
-    if m_size <= 4:
-        return 16, 128, 64, 4, 3
+def _launch_config(
+    m_size: int,
+    group_size: int,
+) -> tuple[int, int, int, int, int, int]:
+    block_k = 64 if group_size >= 64 else 32
+    if m_size <= 16:
+        return 16, 128, block_k, 4, 3, 1
     if m_size <= 64:
-        return 32, 64, 64, 4, 3
-    return 128, 64, 32, 8, 3
+        return 32, 128, block_k, 4, 3, 4
+    return 128, 64, block_k, 4, 3, 1
 
 
 def w4a16_linear(
@@ -140,15 +178,27 @@ def w4a16_linear(
         raise ValueError("input shape does not match in_features")
     if qweight.dtype != torch.uint8:
         raise TypeError("qweight must use torch.uint8")
-    if qweight.shape != (out_features, padded_in_features // 2):
-        raise ValueError("qweight shape does not match the quantization metadata")
     if padded_in_features < in_features or padded_in_features % group_size:
         raise ValueError("invalid padded input size or group size")
-    expected_scale_shape = (out_features, padded_in_features // group_size)
+    n_blocks = triton.cdiv(out_features, W4A16_N_BLOCK)
+    k_blocks = triton.cdiv(padded_in_features, W4A16_K_BLOCK)
+    expected_qweight_shape = (
+        k_blocks,
+        n_blocks,
+        W4A16_K_BLOCK // 2,
+        W4A16_N_BLOCK,
+    )
+    if qweight.shape != expected_qweight_shape:
+        raise ValueError("qweight shape does not match the blocked layout")
+    expected_scale_shape = (
+        padded_in_features // group_size,
+        n_blocks,
+        W4A16_N_BLOCK,
+    )
     if scales.shape != expected_scale_shape:
-        raise ValueError("scale shape does not match the quantization metadata")
+        raise ValueError("scale shape does not match the blocked layout")
     if zeros is not None and zeros.shape != expected_scale_shape:
-        raise ValueError("zero-point shape does not match the quantization metadata")
+        raise ValueError("zero-point shape does not match the blocked layout")
     if bias is not None and bias.shape != (out_features,):
         raise ValueError("bias shape does not match out_features")
 
@@ -159,6 +209,8 @@ def w4a16_linear(
         tensors.append(bias)
     if any(tensor.device != inputs.device for tensor in tensors):
         raise ValueError("all W4A16 tensors must be on the input CUDA device")
+    if any(not tensor.is_contiguous() for tensor in tensors):
+        raise ValueError("all W4A16 weight tensors must be contiguous")
 
     flattened = inputs.reshape(-1, in_features)
     if flattened.stride(1) != 1:
@@ -172,7 +224,14 @@ def w4a16_linear(
     if m_size == 0:
         return output.reshape(*inputs.shape[:-1], out_features)
 
-    block_m, block_n, block_k, num_warps, num_stages = _launch_config(m_size)
+    (
+        block_m,
+        block_n,
+        block_k,
+        num_warps,
+        num_stages,
+        group_m,
+    ) = _launch_config(m_size, group_size)
     grid = (
         triton.cdiv(m_size, block_m) * triton.cdiv(out_features, block_n),
     )
@@ -189,12 +248,9 @@ def w4a16_linear(
             m_size,
             out_features,
             in_features,
+            n_blocks,
             flattened.stride(0),
             flattened.stride(1),
-            qweight.stride(0),
-            qweight.stride(1),
-            scales.stride(0),
-            scales.stride(1),
             output.stride(0),
             output.stride(1),
             GROUP_SIZE=group_size,
@@ -204,6 +260,9 @@ def w4a16_linear(
             BLOCK_M=block_m,
             BLOCK_N=block_n,
             BLOCK_K=block_k,
+            GROUP_M=group_m,
+            LAYOUT_K_BLOCK=W4A16_K_BLOCK,
+            LAYOUT_N_BLOCK=W4A16_N_BLOCK,
             num_warps=num_warps,
             num_stages=num_stages,
         )

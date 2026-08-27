@@ -11,7 +11,7 @@ import torch
 from safetensors import safe_open
 from torch import nn
 
-from hpc101_infer.layers.linear import QuantizedLinearFactory
+from hpc101_infer.layers.linear import QuantizedLinear, QuantizedLinearFactory
 from hpc101_infer.layers.rotary import RotaryEmbedding
 from hpc101_infer.models.config import Gemma4TextConfig
 from hpc101_infer.models.gemma4 import Gemma4ForCausalLM
@@ -165,6 +165,11 @@ def load_gemma4(
             f"missing={sorted(missing)}, unexpected={sorted(unexpected)}, "
             f"duplicated={sorted(duplicated)}"
         )
+
+    if linear_backend == "int4_triton":
+        for module in model.modules():
+            if isinstance(module, QuantizedLinear):
+                module.prepare_triton_layout()
 
     for module in model.modules():
         if isinstance(module, RotaryEmbedding):

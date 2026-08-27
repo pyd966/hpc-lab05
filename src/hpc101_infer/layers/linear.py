@@ -8,7 +8,14 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
-from hpc101_infer.quantization.packing import dequantize_weight
+from hpc101_infer.quantization.packing import (
+    W4A16_LAYOUT,
+    dequantize_weight,
+    pack_w4a16_group_tensor,
+    pack_w4a16_qweight,
+    unpack_w4a16_group_tensor,
+    unpack_w4a16_qweight,
+)
 from hpc101_infer.quantization.types import QuantizedModuleManifest, QuantizedWeight
 
 
@@ -79,6 +86,7 @@ class QuantizedLinear(nn.Module):
         self.symmetric = symmetric
         self.padded_in_features = padded_in_features
         self.backend = backend
+        self.weight_layout = "uint8_little_nibble"
         self.register_buffer(
             "qweight",
             torch.empty(
@@ -147,13 +155,61 @@ class QuantizedLinear(nn.Module):
             module.zeros.copy_(quantized.zeros)
         if bias is not None:
             module.bias.data.copy_(bias)
+        if backend == "triton":
+            module.prepare_triton_layout()
         return module
 
+    def prepare_triton_layout(self) -> None:
+        """Losslessly reorder canonical INT4 buffers for the Triton kernel."""
+        if self.weight_layout == W4A16_LAYOUT:
+            return
+        if self.weight_layout != "uint8_little_nibble":
+            raise RuntimeError(f"unsupported in-memory layout: {self.weight_layout}")
+        num_groups = self.padded_in_features // self.group_size
+        self.qweight = pack_w4a16_qweight(
+            self.qweight,
+            out_features=self.out_features,
+            padded_in_features=self.padded_in_features,
+        )
+        self.scales = pack_w4a16_group_tensor(
+            self.scales,
+            out_features=self.out_features,
+            num_groups=num_groups,
+        )
+        if self.zeros is not None:
+            self.zeros = pack_w4a16_group_tensor(
+                self.zeros,
+                out_features=self.out_features,
+                num_groups=num_groups,
+            )
+        self.weight_layout = W4A16_LAYOUT
+
     def quantized_weight(self) -> QuantizedWeight:
+        qweight = self.qweight
+        scales = self.scales
+        zeros = self.zeros
+        if self.weight_layout == W4A16_LAYOUT:
+            num_groups = self.padded_in_features // self.group_size
+            qweight = unpack_w4a16_qweight(
+                qweight,
+                out_features=self.out_features,
+                padded_in_features=self.padded_in_features,
+            )
+            scales = unpack_w4a16_group_tensor(
+                scales,
+                out_features=self.out_features,
+                num_groups=num_groups,
+            )
+            if zeros is not None:
+                zeros = unpack_w4a16_group_tensor(
+                    zeros,
+                    out_features=self.out_features,
+                    num_groups=num_groups,
+                )
         return QuantizedWeight(
-            qweight=self.qweight,
-            scales=self.scales,
-            zeros=self.zeros,
+            qweight=qweight,
+            scales=scales,
+            zeros=zeros,
             original_shape=(self.out_features, self.in_features),
             padded_shape=(self.out_features, self.padded_in_features),
             bits=4,
@@ -166,6 +222,8 @@ class QuantizedLinear(nn.Module):
         if self.backend == "triton" and inputs.is_cuda:
             from hpc101_infer.kernels.w4a16 import w4a16_linear
 
+            if self.weight_layout != W4A16_LAYOUT:
+                raise RuntimeError("Triton W4A16 weights were not prepared")
             return w4a16_linear(
                 inputs,
                 self.qweight,

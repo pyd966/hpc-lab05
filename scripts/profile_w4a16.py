@@ -13,7 +13,13 @@ import torch
 
 from hpc101_infer import EngineConfig, GenerationRequest, InferenceEngine, Runner
 from hpc101_infer.kernels.w4a16 import w4a16_linear
-from hpc101_infer.quantization.packing import dequantize_weight, pack_int4
+from hpc101_infer.quantization.packing import (
+    W4A16_LAYOUT,
+    dequantize_weight,
+    pack_int4,
+    pack_w4a16_group_tensor,
+    pack_w4a16_qweight,
+)
 from hpc101_infer.quantization.types import QuantizedWeight
 
 
@@ -46,6 +52,8 @@ def make_weight(n_size: int, k_size: int, group_size: int) -> QuantizedWeight:
 
 
 def fused_call(inputs: torch.Tensor, weight: QuantizedWeight) -> torch.Tensor:
+    if weight.packing != W4A16_LAYOUT:
+        raise ValueError("fused benchmark requires blocked W4A16 weights")
     return w4a16_linear(
         inputs,
         weight.qweight,
@@ -56,6 +64,39 @@ def fused_call(inputs: torch.Tensor, weight: QuantizedWeight) -> torch.Tensor:
         out_features=weight.original_shape[0],
         padded_in_features=weight.padded_shape[1],
         group_size=weight.group_size,
+    )
+
+
+def prepare_fused_weight(weight: QuantizedWeight) -> QuantizedWeight:
+    out_features, _ = weight.original_shape
+    padded_in_features = weight.padded_shape[1]
+    num_groups = padded_in_features // weight.group_size
+    return QuantizedWeight(
+        qweight=pack_w4a16_qweight(
+            weight.qweight,
+            out_features=out_features,
+            padded_in_features=padded_in_features,
+        ),
+        scales=pack_w4a16_group_tensor(
+            weight.scales,
+            out_features=out_features,
+            num_groups=num_groups,
+        ),
+        zeros=(
+            None
+            if weight.zeros is None
+            else pack_w4a16_group_tensor(
+                weight.zeros,
+                out_features=out_features,
+                num_groups=num_groups,
+            )
+        ),
+        original_shape=weight.original_shape,
+        padded_shape=weight.padded_shape,
+        bits=weight.bits,
+        group_size=weight.group_size,
+        symmetric=weight.symmetric,
+        packing=W4A16_LAYOUT,
     )
 
 
@@ -99,7 +140,8 @@ def validate_and_benchmark() -> None:
             m_size, k_size, device="cuda", dtype=torch.bfloat16
         )
         reference = reference_call(inputs, weight)
-        fused = fused_call(inputs, weight)
+        fused_weight = prepare_fused_weight(weight)
+        fused = fused_call(inputs, fused_weight)
         difference = (reference.float() - fused.float()).abs()
         print(
             f"CORRECTNESS M={m_size} N={n_size} K={k_size} "
@@ -110,21 +152,34 @@ def validate_and_benchmark() -> None:
     benchmark_cases = (
         (1, 15360, 3840, 20, "decode_gate"),
         (1, 3840, 15360, 20, "decode_down"),
+        (3, 15360, 3840, 20, "decode_gate_b3"),
+        (7, 15360, 3840, 20, "decode_gate_b7"),
+        (10, 15360, 3840, 20, "decode_gate_b10"),
         (128, 15360, 3840, 5, "prefill_gate"),
+        (1500, 15360, 3840, 3, "prefill_gate_m1500"),
+        (2000, 15360, 3840, 3, "prefill_gate_m2000"),
+        (128, 3840, 15360, 5, "prefill_down"),
+        (1500, 3840, 15360, 3, "prefill_down_m1500"),
+        (2000, 3840, 15360, 3, "prefill_down_m2000"),
     )
     for m_size, n_size, k_size, iterations, label in benchmark_cases:
         weight = make_weight(n_size, k_size, 64)
         inputs = torch.randn(
             m_size, k_size, device="cuda", dtype=torch.bfloat16
         )
+        fused_weight = prepare_fused_weight(weight)
         reference_ms = elapsed_ms(
             lambda: reference_call(inputs, weight), iterations
         )
-        fused_ms = elapsed_ms(lambda: fused_call(inputs, weight), iterations)
+        fused_ms = elapsed_ms(
+            lambda: fused_call(inputs, fused_weight), iterations
+        )
         reference_peak = peak_temporary_bytes(
             lambda: reference_call(inputs, weight)
         )
-        fused_peak = peak_temporary_bytes(lambda: fused_call(inputs, weight))
+        fused_peak = peak_temporary_bytes(
+            lambda: fused_call(inputs, fused_weight)
+        )
         print(
             f"MICROBENCH name={label} M={m_size} N={n_size} K={k_size} "
             f"reference_ms={reference_ms:.6f} fused_ms={fused_ms:.6f} "

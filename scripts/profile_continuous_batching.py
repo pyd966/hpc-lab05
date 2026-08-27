@@ -27,6 +27,11 @@ def main() -> None:
     parser.add_argument("--model", required=True)
     parser.add_argument("--input", type=Path, required=True)
     parser.add_argument("--config", type=Path, default=Path("config.yaml"))
+    parser.add_argument(
+        "--include-cpu",
+        action="store_true",
+        help="Also collect CPU operators; this can exceed the 24 GiB full10 limit.",
+    )
     args = parser.parse_args()
 
     requests = load_requests(args.input)
@@ -46,11 +51,11 @@ def main() -> None:
     torch.cuda.synchronize()
     torch.cuda.reset_peak_memory_stats()
 
+    activities = [torch.profiler.ProfilerActivity.CUDA]
+    if args.include_cpu:
+        activities.insert(0, torch.profiler.ProfilerActivity.CPU)
     with torch.profiler.profile(
-        activities=[
-            torch.profiler.ProfilerActivity.CPU,
-            torch.profiler.ProfilerActivity.CUDA,
-        ],
+        activities=activities,
         record_shapes=False,
         profile_memory=False,
     ) as profile:
@@ -67,6 +72,7 @@ def main() -> None:
         "generated_tokens_per_s": generated_tokens / wall_time,
         "peak_allocated_bytes": torch.cuda.max_memory_allocated(),
         "peak_reserved_bytes": torch.cuda.max_memory_reserved(),
+        "profile_activities": [activity.name for activity in activities],
     }
     print("PROFILE_SUMMARY " + json.dumps(summary))
     print(
