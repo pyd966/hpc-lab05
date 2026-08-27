@@ -96,7 +96,9 @@ def test_cache_round_trip_and_invalidation(tmp_path: Path) -> None:
     assert load_quantization_cache(output_dir, _key(source_dir, QuantizationConfig(group_size=64), ids)) is None
 
     shard = output_dir / "model-00001-of-00001.safetensors"
-    shard.write_bytes(shard.read_bytes())
+    corrupted = bytearray(shard.read_bytes())
+    corrupted[0] ^= 1
+    shard.write_bytes(corrupted)
     assert load_quantization_cache(output_dir, cache_key) is None
 
 

@@ -58,6 +58,8 @@ class InferenceEngine:
             config.dtype,
             self.device,
             ring_kv_cache=config.ring_kv_cache,
+            paged_kv_cache=config.paged_kv_cache,
+            paged_kv_block_size=config.paged_kv_block_size,
         )
         self.sampler = Sampler(self.device, self.model.config.vocab_size)
         self._batch_size = 0

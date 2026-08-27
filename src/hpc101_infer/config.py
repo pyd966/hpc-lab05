@@ -86,6 +86,8 @@ class EngineConfig:
     weight_offloading_prefetch: bool = True
     weight_offloading_pin_memory: bool = True
     ring_kv_cache: bool = True
+    paged_kv_cache: bool = True
+    paged_kv_block_size: int = 16
 
     @classmethod
     def from_mapping(cls, raw: Mapping[str, object]) -> EngineConfig:
@@ -118,6 +120,7 @@ class EngineConfig:
             "max_batch_size",
             "scheduler_batch_size",
             "max_sequence_length",
+            "paged_kv_block_size",
             "seed",
         ):
             value = _optional_integer(raw.get(key), f"config.engine.{key}")
@@ -136,6 +139,7 @@ class EngineConfig:
             "weight_offloading_prefetch",
             "weight_offloading_pin_memory",
             "ring_kv_cache",
+            "paged_kv_cache",
         ):
             value = _optional_boolean(raw.get(key), f"config.engine.{key}")
             if value is not None:
@@ -160,6 +164,10 @@ class EngineConfig:
             raise ValueError("scheduler_batch_size must not exceed max_batch_size")
         if self.max_sequence_length <= 0:
             raise ValueError("max_sequence_length must be positive")
+        if self.paged_kv_block_size <= 1 or (
+            self.paged_kv_block_size & (self.paged_kv_block_size - 1)
+        ):
+            raise ValueError("paged_kv_block_size must be a power of two greater than 1")
         if self.attention_backend != "eager":
             raise ValueError("only the eager attention backend is implemented")
         if self.linear_backend not in {"bf16", "int4_reference"}:

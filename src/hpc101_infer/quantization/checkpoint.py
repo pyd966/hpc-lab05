@@ -85,6 +85,20 @@ def quantization_cache_key(
     return hashlib.sha256(encoded).hexdigest()
 
 
+_ARTIFACT_SAMPLE_BYTES = 64 * 1024
+
+
+def _sample_file_digest(path: Path, size: int) -> str:
+    """Hash bounded head/tail samples without scanning multi-GiB shards."""
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        digest.update(stream.read(_ARTIFACT_SAMPLE_BYTES))
+        if size > _ARTIFACT_SAMPLE_BYTES:
+            stream.seek(max(size - _ARTIFACT_SAMPLE_BYTES, 0))
+            digest.update(stream.read(_ARTIFACT_SAMPLE_BYTES))
+    return digest.hexdigest()
+
+
 def _cache_artifact_signatures(output_dir: Path) -> list[dict[str, Any]]:
     names = {
         "config.json",
@@ -103,8 +117,10 @@ def _cache_artifact_signatures(output_dir: Path) -> list[dict[str, Any]]:
             {
                 "path": name,
                 "size": stat.st_size,
+                "mtime_ns": stat.st_mtime_ns,
                 "ctime_ns": stat.st_ctime_ns,
                 "inode": stat.st_ino,
+                "sample_sha256": _sample_file_digest(path, stat.st_size),
             }
         )
     return signatures
@@ -166,8 +182,17 @@ def load_quantization_cache(
             stat = path.stat()
             if (
                 stat.st_size != artifact["size"]
+                or (
+                    artifact.get("mtime_ns") is not None
+                    and stat.st_mtime_ns != artifact["mtime_ns"]
+                )
                 or stat.st_ctime_ns != artifact["ctime_ns"]
                 or stat.st_ino != artifact["inode"]
+                or (
+                    artifact.get("sample_sha256") is not None
+                    and _sample_file_digest(path, stat.st_size)
+                    != artifact["sample_sha256"]
+                )
             ):
                 return None
         source = QuantizedCheckpointSource(output_path)

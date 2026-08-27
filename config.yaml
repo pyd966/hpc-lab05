@@ -12,6 +12,8 @@ engine:
   weight_offloading_prefetch: true
   weight_offloading_pin_memory: true
   ring_kv_cache: true
+  paged_kv_cache: true
+  paged_kv_block_size: 16
 
 quantization:
   algorithm: gptq
