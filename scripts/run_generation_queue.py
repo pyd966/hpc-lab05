@@ -53,7 +53,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--attention-backend", choices=("eager",), default="eager")
     parser.add_argument(
         "--linear-backend",
-        choices=("bf16", "int4_reference"),
+        choices=("bf16", "int4_reference", "int4_triton"),
         default="bf16",
     )
     parser.add_argument(

@@ -98,16 +98,18 @@ def load_gemma4(
         config = replace(config, max_position_embeddings=max_position_embeddings)
 
     is_quantized = (model_path / "quantization_config.json").is_file()
-    if linear_backend not in {"bf16", "int4_reference"}:
+    if linear_backend not in {"bf16", "int4_reference", "int4_triton"}:
         raise ValueError(f"unsupported linear backend: {linear_backend}")
-    if linear_backend == "int4_reference" and not is_quantized:
-        raise ValueError("int4_reference requires a quantized checkpoint")
+    if linear_backend.startswith("int4_") and not is_quantized:
+        raise ValueError(f"{linear_backend} requires a quantized checkpoint")
 
     if is_quantized:
         source = QuantizedCheckpointSource(model_path)
         scale_dtype = SCALE_DTYPES[source.quantization_config.scale_dtype]
         linear_factory = QuantizedLinearFactory(
-            source.manifest, scale_dtype=scale_dtype
+            source.manifest,
+            scale_dtype=scale_dtype,
+            backend="triton" if linear_backend == "int4_triton" else "reference",
         )
         source_to_local = _quantized_key_map(source)
         prefix = ""

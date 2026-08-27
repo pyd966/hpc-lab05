@@ -157,8 +157,8 @@ python3 scripts/evaluate_quality.py \
   --dataset datasets/quality_public.jsonl \
   --output results/gptq-public-quality.json \
   --reference results/bf16-public-quality.json \
-  --max-delta-nll 0.16 \
-  --linear-backend int4_reference \
+  --max-delta-nll 0.1 \
+  --linear-backend int4_triton \
   --device cuda \
   --dtype bfloat16 \
   --max-sequence-length 2048 \
@@ -173,6 +173,8 @@ python3 scripts/evaluate_quality.py \
 - `passed`：`delta_nll` 是否不超过 `--max-delta-nll`，当实测 `delta_nll > max_delta_nll` 时，`passed` 为 `false`，脚本会以非零状态退出。
 
 你可以将测试结果中的 `delta_nll` 与实验手册中任务一的得分曲线进行对照，确认量化精度是否满足要求。
+
+仓库 `config.yaml` 的量化 CUDA 推理路径默认使用自写的 `int4_triton` 反量化-GEMM 融合 kernel；`int4_reference` 保留用于正确性和性能 A/B。两者读取同一份 packed INT4 checkpoint，切换后端不会重新量化。
 
 调试时可以使用 `--limit N` 只评测前 `N` 条记录；正式记录结果时不要限制样本数量。`--chunk-size` 只控制每次产生 logits 的 token 数，可在显存不足时适当减小。
 
@@ -238,7 +240,7 @@ python3 scripts/run_generation_queue.py \
 | `--max-batch-size N`                                 | KV cache 可容纳的最大 batch；显式设置 `--batch-size` 且未设置本参数时，两者取相同值 | `engine.max_batch_size`，缺省为 `1`               |
 | `--max-sequence-length N`                            | 单条请求的 prompt 与生成 token 的最大总长度                                         | `engine.max_sequence_length`，缺省为 `4096`       |
 | `--attention-backend BACKEND`                        | 注意力实现；当前仅支持 `eager`                                                      | `engine.attention_backend`，缺省为 `eager`        |
-| `--linear-backend BACKEND`                           | Linear 实现，可选 `bf16`、`int4_reference`                                          | `engine.linear_backend`，缺省为 `bf16`            |
+| `--linear-backend BACKEND`                           | Linear 实现，可选 `bf16`、`int4_reference`、`int4_triton`                         | `engine.linear_backend`，缺省为 `bf16`            |
 | `--scheduler-backend BACKEND`                        | 调度器实现；当前仅支持 `static_batch`                                               | `engine.scheduler_backend`，缺省为 `static_batch` |
 | `--max-new-tokens N`                                 | 请求记录未提供 `max_new_tokens` 时使用的默认生成长度；不能从配置文件读取            | `32`                                              |
 | `--seed N`                                           | 采样随机种子                                                                        | `engine.seed`，缺省为 `0`                         |

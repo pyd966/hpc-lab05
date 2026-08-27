@@ -232,7 +232,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--dtype", choices=DTYPES, default="bfloat16")
     parser.add_argument(
         "--linear-backend",
-        choices=("bf16", "int4_reference"),
+        choices=("bf16", "int4_reference", "int4_triton"),
         default="int4_reference",
     )
     parser.add_argument("--max-sequence-length", type=int, default=2048)

@@ -1,0 +1,78 @@
+{
+  "schema_version": 2,
+  "model": "/home/h3250106394/quantized/gemma-4-12b-gptq-group64",
+  "linear_backend": "int4_triton",
+  "dataset": "datasets/quality_public.jsonl",
+  "dataset_sha256": "61f9a48a4b7ee0c0bf9cb415cbcf257ee0d18666787b58dc21f25abdfc99290f",
+  "chunk_size": 128,
+  "bucket_lengths": [
+    128,
+    256,
+    512,
+    1024,
+    2048
+  ],
+  "nll_sum": 48902.108225246884,
+  "token_count": 20418,
+  "sequence_count": 62,
+  "mean_nll": 2.395048889472372,
+  "perplexity": 10.968734301604597,
+  "by_bucket": {
+    "128": {
+      "nll_sum": 12327.571057349262,
+      "token_count": 4064,
+      "sequence_count": 32,
+      "mean_nll": 3.0333590200170426,
+      "perplexity": 20.766871902399394,
+      "reference_mean_nll": 2.945143927673276,
+      "delta_nll": 0.08821509234376679,
+      "perplexity_ratio": 1.0922230255748016
+    },
+    "256": {
+      "nll_sum": 10170.59063362392,
+      "token_count": 4080,
+      "sequence_count": 16,
+      "mean_nll": 2.492791821966647,
+      "perplexity": 12.094996104257449,
+      "reference_mean_nll": 2.430436479992495,
+      "delta_nll": 0.06235534197415227,
+      "perplexity_ratio": 1.0643404823881455
+    },
+    "512": {
+      "nll_sum": 9770.400501920667,
+      "token_count": 4088,
+      "sequence_count": 8,
+      "mean_nll": 2.3900196922506525,
+      "perplexity": 10.913708856416251,
+      "reference_mean_nll": 2.3247355590035936,
+      "delta_nll": 0.06528413324705884,
+      "perplexity_ratio": 1.0674622828237814
+    },
+    "1024": {
+      "nll_sum": 8376.685341571467,
+      "token_count": 4092,
+      "sequence_count": 4,
+      "mean_nll": 2.047088304391854,
+      "perplexity": 7.74531623885686,
+      "reference_mean_nll": 1.90839071657943,
+      "delta_nll": 0.13869758781242392,
+      "perplexity_ratio": 1.1487766434109288
+    },
+    "2048": {
+      "nll_sum": 8256.860690781568,
+      "token_count": 4094,
+      "sequence_count": 2,
+      "mean_nll": 2.0168199049295477,
+      "perplexity": 7.514390420884781,
+      "reference_mean_nll": 1.9384820409680328,
+      "delta_nll": 0.07833786396151488,
+      "perplexity_ratio": 1.0814879927675622
+    }
+  },
+  "reference": "results/bf16-public-quality.json",
+  "reference_mean_nll": 2.3084555301012055,
+  "delta_nll": 0.0865933593711663,
+  "perplexity_ratio": 1.0904531669877038,
+  "max_delta_nll": 0.1,
+  "passed": true
+}

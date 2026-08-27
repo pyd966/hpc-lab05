@@ -45,7 +45,7 @@ class BF16LinearFactory:
 
 
 class QuantizedLinear(nn.Module):
-    """保存 packed INT4 权重，并在 forward 中临时反量化。
+    """保存 packed INT4 权重，并通过参考或 Triton 后端执行 Linear。
 
     ``qweight`` 使用一个 uint8 保存两个 4-bit code；``scales`` 和可选的
     ``zeros`` 按 ``[out_features, num_groups]`` 存储。输入维度会补齐到
@@ -62,8 +62,11 @@ class QuantizedLinear(nn.Module):
         bias: bool = False,
         device: torch.device | str | None = None,
         scale_dtype: torch.dtype = torch.float16,
+        backend: str = "reference",
     ) -> None:
         super().__init__()
+        if backend not in {"reference", "triton"}:
+            raise ValueError("quantized linear backend must be reference or triton")
         if padded_in_features is None:
             padded_in_features = (
                 (in_features + group_size - 1) // group_size * group_size
@@ -75,6 +78,7 @@ class QuantizedLinear(nn.Module):
         self.group_size = group_size
         self.symmetric = symmetric
         self.padded_in_features = padded_in_features
+        self.backend = backend
         self.register_buffer(
             "qweight",
             torch.empty(
@@ -107,13 +111,23 @@ class QuantizedLinear(nn.Module):
             ),
         )
         if bias:
-            self.bias = nn.Parameter(torch.empty(out_features, device=device))
+            self.bias = nn.Parameter(
+                torch.empty(
+                    out_features,
+                    device=device,
+                    dtype=scale_dtype,
+                )
+            )
         else:
             self.register_parameter("bias", None)
 
     @classmethod
     def from_quantized_weight(
-        cls, quantized: QuantizedWeight, bias: torch.Tensor | None = None
+        cls,
+        quantized: QuantizedWeight,
+        bias: torch.Tensor | None = None,
+        *,
+        backend: str = "reference",
     ) -> "QuantizedLinear":
         out_features, in_features = quantized.original_shape
         module = cls(
@@ -125,6 +139,7 @@ class QuantizedLinear(nn.Module):
             bias=bias is not None,
             device=quantized.qweight.device,
             scale_dtype=quantized.scales.dtype,
+            backend=backend,
         )
         module.qweight.copy_(quantized.qweight)
         module.scales.copy_(quantized.scales)
@@ -148,10 +163,29 @@ class QuantizedLinear(nn.Module):
         )
 
     def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+        if self.backend == "triton" and inputs.is_cuda:
+            from hpc101_infer.kernels.w4a16 import w4a16_linear
+
+            return w4a16_linear(
+                inputs,
+                self.qweight,
+                self.scales,
+                self.zeros,
+                self.bias,
+                in_features=self.in_features,
+                out_features=self.out_features,
+                padded_in_features=self.padded_in_features,
+                group_size=self.group_size,
+            )
         # 参考实现允许在单次 forward 内生成高精度临时权重，但不会把完整
         # FP16/BF16 权重持久保存在 module 中。融合 kernel 可替换这一过程。
         weight = dequantize_weight(self.quantized_weight(), dtype=inputs.dtype)
-        return F.linear(inputs, weight, self.bias)
+        bias = (
+            None
+            if self.bias is None
+            else self.bias.to(device=inputs.device, dtype=inputs.dtype)
+        )
+        return F.linear(inputs, weight, bias)
 
 
 class QuantizedLinearFactory:
@@ -160,11 +194,15 @@ class QuantizedLinearFactory:
         manifest: Mapping[str, QuantizedModuleManifest],
         *,
         scale_dtype: torch.dtype = torch.float16,
+        backend: str = "reference",
     ) -> None:
         if scale_dtype not in {torch.float16, torch.bfloat16}:
             raise ValueError("scale_dtype must be float16 or bfloat16")
         self.manifest = dict(manifest)
         self.scale_dtype = scale_dtype
+        if backend not in {"reference", "triton"}:
+            raise ValueError("quantized linear backend must be reference or triton")
+        self.backend = backend
         self._fallback = BF16LinearFactory()
 
     def create(
@@ -198,4 +236,5 @@ class QuantizedLinearFactory:
             bias=bias,
             device=device,
             scale_dtype=scale_dtype,
+            backend=self.backend,
         )
