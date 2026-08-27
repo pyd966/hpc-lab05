@@ -573,6 +573,9 @@ class KVCache:
         self.max_batch_size = max_batch_size
         self.max_sequence_length = max_sequence_length
         self._committed_max_length = 0
+        self._slot_block_credits = [
+            [0] * max_batch_size for _ in self.layers
+        ]
 
     @classmethod
     def allocate(
@@ -586,6 +589,8 @@ class KVCache:
         ring_kv_cache: bool = True,
         paged_kv_cache: bool = True,
         paged_kv_block_size: int = 16,
+        paged_kv_global_pool_blocks: int | None = None,
+        paged_kv_sliding_pool_blocks: int | None = None,
     ) -> "KVCache":
         if max_batch_size <= 0 or max_sequence_length <= 0:
             raise ValueError("cache capacities must be positive")
@@ -632,6 +637,19 @@ class KVCache:
                         max_sequence_length + paged_kv_block_size - 1
                     ) // paged_kv_block_size
                 pool_blocks = max_batch_size * max_blocks
+                pool_limit = (
+                    paged_kv_sliding_pool_blocks
+                    if ring
+                    else paged_kv_global_pool_blocks
+                )
+                if pool_limit is not None:
+                    if pool_limit < max_blocks:
+                        cache_kind = "ring" if ring else "full"
+                        raise ValueError(
+                            f"paged {cache_kind} pool must hold at least one "
+                            f"maximum-length sequence ({max_blocks} blocks)"
+                        )
+                    pool_blocks = min(pool_blocks, pool_limit)
                 shape = (
                     pool_blocks,
                     paged_kv_block_size,
@@ -719,7 +737,51 @@ class KVCache:
     def reset(self, batch_size: int) -> None:
         for layer in self.layers:
             layer.reset(batch_size)
+        for credits in self._slot_block_credits:
+            credits[:] = [0] * self.max_batch_size
         self._committed_max_length = 0
+
+    @staticmethod
+    def _block_demand(
+        layer: LayerKVCache | PagedLayerKVCache,
+        max_length: int,
+    ) -> int:
+        if not isinstance(layer, PagedLayerKVCache):
+            return 0
+        blocks = (max_length + layer.block_size - 1) // layer.block_size
+        return min(blocks, layer.max_blocks_per_sequence) if layer.ring else blocks
+
+    def can_fit_request(self, max_length: int) -> bool:
+        if not 0 < max_length <= self.max_sequence_length:
+            return False
+        return all(
+            self._block_demand(layer, max_length)
+            <= getattr(layer, "pool_blocks", self.max_batch_size)
+            for layer in self.layers
+        )
+
+    def can_admit(self, max_length: int) -> bool:
+        if not self.can_fit_request(max_length):
+            return False
+        return all(
+            sum(credits) + self._block_demand(layer, max_length)
+            <= getattr(layer, "pool_blocks", self.max_batch_size)
+            for layer, credits in zip(
+                self.layers, self._slot_block_credits, strict=True
+            )
+        )
+
+    def admit(self, batch_slot: int, max_length: int) -> None:
+        if not 0 <= batch_slot < self.max_batch_size:
+            raise IndexError("cache slot is outside the cache capacity")
+        if any(credits[batch_slot] for credits in self._slot_block_credits):
+            raise RuntimeError("cache slot already owns KV block credit")
+        if not self.can_admit(max_length):
+            raise RuntimeError("paged KV cache has insufficient lifecycle credit")
+        for layer, credits in zip(
+            self.layers, self._slot_block_credits, strict=True
+        ):
+            credits[batch_slot] = self._block_demand(layer, max_length)
 
     @property
     def committed_max_length(self) -> int:
@@ -754,10 +816,12 @@ class KVCache:
         """Reserve every page needed by a compact continuous-batch operation."""
         if len(batch_slots) != len(sequence_ranges):
             raise ValueError("batch_slots and sequence_ranges must have equal length")
+        plans: list[tuple[PagedLayerKVCache, list[tuple[int, int]]]] = []
         for layer in self.layers:
             if not isinstance(layer, PagedLayerKVCache):
                 continue
-            table_changed = False
+            plan: list[tuple[int, int]] = []
+            empty_slots: set[tuple[int, int]] = set()
             for cache_slot, (start, end) in zip(
                 batch_slots, sequence_ranges, strict=True
             ):
@@ -773,11 +837,28 @@ class KVCache:
                 first_block = retained_start // layer.block_size
                 last_block = (end - 1) // layer.block_size
                 for logical_block in range(first_block, last_block + 1):
-                    table_changed |= layer._ensure_block(
-                        cache_slot,
-                        logical_block,
-                        sync_table=False,
+                    page_slot = (
+                        logical_block % layer.max_blocks_per_sequence
+                        if layer.ring
+                        else logical_block
                     )
+                    if layer._slot_logical[cache_slot][page_slot] == logical_block:
+                        continue
+                    if layer._slot_physical[cache_slot][page_slot] < 0:
+                        empty_slots.add((cache_slot, page_slot))
+                    plan.append((cache_slot, logical_block))
+            if len(empty_slots) > len(layer._free_blocks):
+                raise RuntimeError("paged KV cache block pool is exhausted")
+            plans.append((layer, plan))
+
+        for layer, plan in plans:
+            table_changed = False
+            for cache_slot, logical_block in plan:
+                table_changed |= layer._ensure_block(
+                    cache_slot,
+                    logical_block,
+                    sync_table=False,
+                )
             if table_changed:
                 layer.block_table[: layer.batch_size].copy_(
                     torch.tensor(
@@ -802,8 +883,12 @@ class KVCache:
 
     def release(self, batch_indices: Iterable[int]) -> None:
         indices = tuple(batch_indices)
-        for layer in self.layers:
+        for layer, credits in zip(
+            self.layers, self._slot_block_credits, strict=True
+        ):
             layer.release(indices)
+            for batch_idx in indices:
+                credits[batch_idx] = 0
 
     def commit(
         self,

@@ -9,6 +9,7 @@ from torch.nn import functional as F
 from hpc101_infer.layers.attention import AttentionLayer, SlidingAttentionLayer
 from hpc101_infer.layers.linear import BF16LinearFactory, LinearFactory
 from hpc101_infer.layers.norm import RMSNorm
+from hpc101_infer.layers.rotary import RotaryEmbedding
 from hpc101_infer.models.config import Gemma4TextConfig
 from hpc101_infer.runtime.batch import Batch
 from hpc101_infer.runtime.kv_cache import KVCache
@@ -169,6 +170,8 @@ class Gemma4ForCausalLM(nn.Module):
         *,
         prefetch: bool = True,
         pin_memory: bool = True,
+        resident_mlp: bool = False,
+        resident_mlp_layers: int | None = None,
     ) -> None:
         """将 decoder layers 保留在 pinned CPU，并启用异步 GPU 预取。"""
         if self._offloader is not None:
@@ -178,12 +181,79 @@ class Gemma4ForCausalLM(nn.Module):
             raise ValueError("weight offloading requires a CUDA device")
         self.embed_tokens.to(device=device)
         self.norm.to(device=device)
+        offloaded_layers: list[nn.Module]
+        if resident_mlp:
+            resident_count = (
+                len(self.layers)
+                if resident_mlp_layers is None
+                else resident_mlp_layers
+            )
+            if not 0 <= resident_count <= len(self.layers):
+                raise ValueError("resident_mlp_layers exceeds the decoder layer count")
+            offloaded_count = len(self.layers) - resident_count
+            offload_order = [
+                index
+                for index, layer in enumerate(self.layers)
+                if layer.attn_type == "sliding_attention"
+            ] + [
+                index
+                for index, layer in enumerate(self.layers)
+                if layer.attn_type != "sliding_attention"
+            ]
+            offloaded_mlp = set(offload_order[:offloaded_count])
+            offloaded_layers = []
+            rotary_caches: dict[tuple[object, ...], torch.Tensor] = {}
+            for layer_index, layer in enumerate(self.layers):
+                rotary = layer.self_attn.rotary
+                rotary_key = (
+                    rotary.config.rope_type,
+                    rotary.config.rope_theta,
+                    rotary.config.partial_rotary_factor,
+                    rotary.config.factor,
+                    rotary.head_dim,
+                    rotary.max_position_embeddings,
+                )
+                shared_cache = rotary_caches.get(rotary_key)
+                if shared_cache is None:
+                    shared_cache = rotary._cos_sin_cache.to(device=device)
+                    rotary_caches[rotary_key] = shared_cache
+                rotary._buffers["_cos_sin_cache"] = shared_cache
+                if layer_index in offloaded_mlp:
+                    offloaded_layers.append(layer)
+                    continue
+                layer.mlp.to(device=device)
+                layer.input_layernorm.to(device=device)
+                layer.post_attention_layernorm.to(device=device)
+                layer.pre_feedforward_layernorm.to(device=device)
+                layer.post_feedforward_layernorm.to(device=device)
+                for name, parameter in tuple(layer._parameters.items()):
+                    if parameter is not None:
+                        layer._parameters[name] = nn.Parameter(
+                            parameter.to(device=device),
+                            requires_grad=parameter.requires_grad,
+                        )
+                for name, buffer in tuple(layer._buffers.items()):
+                    if buffer is not None:
+                        layer._buffers[name] = buffer.to(device=device)
+                offloaded_layers.append(layer.self_attn)
+        else:
+            offloaded_layers = list(self.layers)
         self._offloader = AsyncLayerOffloader(
-            self.layers,
+            offloaded_layers,
             device,
             pin_memory=pin_memory,
+            tensor_filter=(
+                (lambda owner, _name, _tensor: not isinstance(owner, RotaryEmbedding))
+                if resident_mlp
+                else None
+            ),
         )
         self._offload_prefetch = prefetch
+
+    def offloading_stats(self) -> dict[str, int] | None:
+        if self._offloader is None:
+            return None
+        return self._offloader.stats()
 
     def forward(
         self,

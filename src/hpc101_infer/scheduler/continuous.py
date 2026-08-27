@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import heapq
 from collections import deque
+from collections.abc import Callable
 
 from hpc101_infer.scheduler.base import (
     RequestState,
@@ -19,6 +20,8 @@ class ContinuousBatchScheduler:
         max_batch_size: int,
         prefill_token_budget: int,
         default_stop_token_ids: tuple[int, ...],
+        can_admit: Callable[[RequestState], bool] | None = None,
+        on_admit: Callable[[int, RequestState], None] | None = None,
     ) -> None:
         if max_batch_size <= 0:
             raise ValueError("max_batch_size must be positive")
@@ -27,6 +30,8 @@ class ContinuousBatchScheduler:
         self.max_batch_size = max_batch_size
         self.prefill_token_budget = prefill_token_budget
         self.default_stop_token_ids = default_stop_token_ids
+        self._can_admit = can_admit
+        self._on_admit = on_admit
         self.pending: deque[RequestState] = deque()
         self.active: dict[int, RequestState] = {}
         self._free_slots = list(range(max_batch_size))
@@ -42,7 +47,14 @@ class ContinuousBatchScheduler:
         self.pending.append(request)
 
     def can_schedule_prefill(self) -> bool:
-        return bool(self.pending and self._free_slots)
+        return bool(
+            self.pending
+            and self._free_slots
+            and (
+                self._can_admit is None
+                or self._can_admit(self.pending[0])
+            )
+        )
 
     def schedule_prefill(self) -> ScheduledOutput:
         if not self.can_schedule_prefill():
@@ -50,13 +62,22 @@ class ContinuousBatchScheduler:
         scheduled: list[ScheduledRequest] = []
         padded_length = 0
         while self.pending and self._free_slots:
+            state = self.pending[0]
+            if self._can_admit is not None and not self._can_admit(state):
+                break
             prompt_length = len(self.pending[0].prompt_token_ids)
             candidate_length = max(padded_length, prompt_length)
             candidate_work = (len(scheduled) + 1) * candidate_length
             if scheduled and candidate_work > self.prefill_token_budget:
                 break
-            state = self.pending.popleft()
             slot = heapq.heappop(self._free_slots)
+            if self._on_admit is not None:
+                try:
+                    self._on_admit(slot, state)
+                except Exception:
+                    heapq.heappush(self._free_slots, slot)
+                    raise
+            self.pending.popleft()
             state.cache_slot = slot
             state.num_computed_tokens = prompt_length
             state.status = RequestStatus.PREFILLING

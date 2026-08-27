@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 
 import torch
@@ -42,6 +43,7 @@ class AsyncLayerOffloader:
         device: str | torch.device,
         *,
         pin_memory: bool = True,
+        tensor_filter: Callable[[nn.Module, str, torch.Tensor], bool] | None = None,
     ) -> None:
         self.layers = tuple(layers)
         self.device = torch.device(device)
@@ -54,7 +56,12 @@ class AsyncLayerOffloader:
 
         self._non_blocking = pin_memory
         self._payloads = [
-            self._pack_layer(layer, pin_memory=pin_memory) for layer in self.layers
+            self._pack_layer(
+                layer,
+                pin_memory=pin_memory,
+                tensor_filter=tensor_filter,
+            )
+            for layer in self.layers
         ]
         self._buffer_bytes = max(payload.host.numel() for payload in self._payloads)
         with torch.cuda.device(self.device):
@@ -85,12 +92,17 @@ class AsyncLayerOffloader:
         layer: nn.Module,
         *,
         pin_memory: bool,
+        tensor_filter: Callable[[nn.Module, str, torch.Tensor], bool] | None,
     ) -> _LayerPayload:
         """将一层的所有 tensor 合并为一个按字节寻址的连续 payload。"""
         entries: list[tuple[nn.Module, str, torch.Tensor, bool, bool]] = []
         for owner in layer.modules():
             for name, parameter in tuple(owner._parameters.items()):
                 if parameter is None:
+                    continue
+                if tensor_filter is not None and not tensor_filter(
+                    owner, name, parameter
+                ):
                     continue
                 if parameter.device.type != "cpu":
                     raise ValueError(
@@ -102,6 +114,10 @@ class AsyncLayerOffloader:
                 )
             for name, buffer in tuple(owner._buffers.items()):
                 if buffer is None:
+                    continue
+                if tensor_filter is not None and not tensor_filter(
+                    owner, name, buffer
+                ):
                     continue
                 if buffer.device.type != "cpu":
                     raise ValueError(

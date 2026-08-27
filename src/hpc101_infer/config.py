@@ -86,9 +86,13 @@ class EngineConfig:
     weight_offloading: bool = False
     weight_offloading_prefetch: bool = True
     weight_offloading_pin_memory: bool = True
+    weight_resident_mlp: bool = False
+    weight_resident_mlp_layers: int | None = None
     ring_kv_cache: bool = True
     paged_kv_cache: bool = True
     paged_kv_block_size: int = 16
+    paged_kv_global_pool_blocks: int | None = None
+    paged_kv_sliding_pool_blocks: int | None = None
 
     @classmethod
     def from_mapping(cls, raw: Mapping[str, object]) -> EngineConfig:
@@ -122,8 +126,11 @@ class EngineConfig:
             "scheduler_batch_size",
             "max_sequence_length",
             "paged_kv_block_size",
+            "paged_kv_global_pool_blocks",
+            "paged_kv_sliding_pool_blocks",
             "prefill_token_budget",
             "seed",
+            "weight_resident_mlp_layers",
         ):
             value = _optional_integer(raw.get(key), f"config.engine.{key}")
             if value is not None:
@@ -140,6 +147,7 @@ class EngineConfig:
             "weight_offloading",
             "weight_offloading_prefetch",
             "weight_offloading_pin_memory",
+            "weight_resident_mlp",
             "ring_kv_cache",
             "paged_kv_cache",
         ):
@@ -170,6 +178,33 @@ class EngineConfig:
             self.paged_kv_block_size & (self.paged_kv_block_size - 1)
         ):
             raise ValueError("paged_kv_block_size must be a power of two greater than 1")
+        if (
+            self.paged_kv_global_pool_blocks is not None
+            and self.paged_kv_global_pool_blocks <= 0
+        ):
+            raise ValueError("paged_kv_global_pool_blocks must be positive")
+        if (
+            self.paged_kv_sliding_pool_blocks is not None
+            and self.paged_kv_sliding_pool_blocks <= 0
+        ):
+            raise ValueError("paged_kv_sliding_pool_blocks must be positive")
+        custom_kv_pool = (
+            self.paged_kv_global_pool_blocks is not None
+            or self.paged_kv_sliding_pool_blocks is not None
+        )
+        if custom_kv_pool and not self.paged_kv_cache:
+            raise ValueError("custom KV pools require paged_kv_cache")
+        if custom_kv_pool and self.scheduler_backend != "continuous":
+            raise ValueError("custom KV pools require the continuous scheduler")
+        if (
+            self.weight_resident_mlp_layers is not None
+            and self.weight_resident_mlp_layers < 0
+        ):
+            raise ValueError("weight_resident_mlp_layers must be non-negative")
+        if self.weight_resident_mlp_layers is not None and not self.weight_resident_mlp:
+            raise ValueError(
+                "weight_resident_mlp_layers requires weight_resident_mlp"
+            )
         if self.attention_backend not in {"eager", "triton_flash"}:
             raise ValueError("attention_backend must be eager or triton_flash")
         if self.linear_backend not in {"bf16", "int4_reference", "int4_triton"}:

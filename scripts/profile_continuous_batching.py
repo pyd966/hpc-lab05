@@ -49,6 +49,8 @@ def main() -> None:
     warmup_requests = [replace(request, max_new_tokens=2) for request in requests]
     runner.run(warmup_requests)
     torch.cuda.synchronize()
+    warmup_offloading = engine.model.offloading_stats()
+    torch.cuda.empty_cache()
     torch.cuda.reset_peak_memory_stats()
 
     activities = [torch.profiler.ProfilerActivity.CUDA]
@@ -65,6 +67,14 @@ def main() -> None:
         wall_time = perf_counter() - started
 
     generated_tokens = sum(output.generated_tokens for output in outputs)
+    offloading = engine.model.offloading_stats()
+    if offloading is not None and warmup_offloading is not None:
+        for key in (
+            "host_to_device_bytes",
+            "device_to_host_bytes",
+            "prefetch_calls",
+        ):
+            offloading[key] -= warmup_offloading[key]
     summary = {
         "requests": len(outputs),
         "generated_tokens": generated_tokens,
@@ -73,6 +83,7 @@ def main() -> None:
         "peak_allocated_bytes": torch.cuda.max_memory_allocated(),
         "peak_reserved_bytes": torch.cuda.max_memory_reserved(),
         "profile_activities": [activity.name for activity in activities],
+        "offloading": offloading,
     }
     print("PROFILE_SUMMARY " + json.dumps(summary))
     print(

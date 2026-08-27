@@ -42,11 +42,23 @@ class InferenceEngine:
         self.config = config
         self.tokenizer = tokenizer
         self.device = torch.device(config.device)
+        if self.device.type == "cuda":
+            with torch.cuda.device(self.device):
+                warmup = torch.empty(
+                    (16, 16),
+                    dtype=config.dtype,
+                    device=self.device,
+                )
+                torch.mm(warmup, warmup)
+                torch.cuda.synchronize(self.device)
+                del warmup
         if config.weight_offloading:
             model.enable_async_weight_offloading(
                 self.device,
                 prefetch=config.weight_offloading_prefetch,
                 pin_memory=config.weight_offloading_pin_memory,
+                resident_mlp=config.weight_resident_mlp,
+                resident_mlp_layers=config.weight_resident_mlp_layers,
             )
         else:
             first_parameter = next(model.parameters())
@@ -65,6 +77,8 @@ class InferenceEngine:
             ring_kv_cache=config.ring_kv_cache,
             paged_kv_cache=config.paged_kv_cache,
             paged_kv_block_size=config.paged_kv_block_size,
+            paged_kv_global_pool_blocks=config.paged_kv_global_pool_blocks,
+            paged_kv_sliding_pool_blocks=config.paged_kv_sliding_pool_blocks,
         )
         self.sampler = Sampler(self.device, self.model.config.vocab_size)
         self._batch_size = 0
@@ -452,16 +466,30 @@ class InferenceEngine:
             for request, prompt_tokens in zip(requests, encoded, strict=True)
         ]
         state_indices = {id(state): index for index, state in enumerate(states)}
+        self.cache.reset(self.config.max_batch_size)
+        self._batch_size = self.config.max_batch_size
+
+        def request_cache_length(state: RequestState) -> int:
+            return len(state.prompt_token_ids) + state.request.max_new_tokens
+
         scheduler = ContinuousBatchScheduler(
             max_batch_size=self.config.scheduler_batch_size,
             prefill_token_budget=self.config.prefill_token_budget,
             default_stop_token_ids=(self.model.config.eos_token_id,),
+            can_admit=lambda state: self.cache.can_admit(
+                request_cache_length(state)
+            ),
+            on_admit=lambda slot, state: self.cache.admit(
+                slot, request_cache_length(state)
+            ),
         )
         for state in states:
+            if not self.cache.can_fit_request(request_cache_length(state)):
+                raise ValueError(
+                    "request prompt plus max_new_tokens exceeds the configured "
+                    "paged KV pool capacity"
+                )
             scheduler.add_request(state)
-
-        self.cache.reset(self.config.max_batch_size)
-        self._batch_size = self.config.max_batch_size
         prefill_latencies = [0.0] * len(states)
         decode_latencies: list[list[float]] = [[] for _ in states]
         completion_times = [0.0] * len(states)
