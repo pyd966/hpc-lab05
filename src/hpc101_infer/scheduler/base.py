@@ -21,6 +21,7 @@ class RequestState:
     num_computed_tokens: int = 0
     status: RequestStatus = RequestStatus.PENDING
     finish_reason: str = ""
+    cache_slot: int | None = None
 
 
 @dataclass
@@ -37,6 +38,13 @@ class ScheduledOutput:
     @property
     def batch_max_length(self) -> int:
         return max(scheduled.request.num_computed_tokens for scheduled in self.requests)
+
+    @property
+    def cache_slots(self) -> tuple[int, ...]:
+        slots = tuple(scheduled.request.cache_slot for scheduled in self.requests)
+        if any(slot is None for slot in slots):
+            raise RuntimeError("scheduled request has no cache slot")
+        return tuple(int(slot) for slot in slots)
 
 
 class Scheduler(Protocol):

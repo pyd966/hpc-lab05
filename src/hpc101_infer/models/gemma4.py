@@ -113,6 +113,10 @@ class DecoderLayer(nn.Module):
         sequence_lengths: torch.Tensor,
         max_seq_len: int,
         kv_cache: KVCache | None,
+        cache_indices: torch.Tensor | None = None,
+        cache_slots: tuple[int, ...] | None = None,
+        cache_ranges: tuple[tuple[int, int], ...] | None = None,
+        past_max_seq_len: int = 0,
     ) -> torch.Tensor:
         residual = hidden_states
         hidden_states = self.self_attn(
@@ -122,6 +126,10 @@ class DecoderLayer(nn.Module):
             max_seq_len,
             self.layer_idx,
             kv_cache,
+            cache_indices,
+            cache_slots,
+            cache_ranges,
+            past_max_seq_len,
         )
         hidden_states = residual + self.post_attention_layernorm(hidden_states)
         residual = hidden_states
@@ -182,6 +190,7 @@ class Gemma4ForCausalLM(nn.Module):
         model_input: Batch | torch.Tensor,
         kv_cache: KVCache | None = None,
         logits_to_keep: int = 0,
+        logits_indices: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if isinstance(model_input, torch.Tensor):
             input_ids = model_input
@@ -202,6 +211,18 @@ class Gemma4ForCausalLM(nn.Module):
             position_ids = model_input.positions
             sequence_lengths = model_input.sequence_lengths
             max_seq_len = model_input.curr_max_seq_len
+        cache_indices = (
+            None if isinstance(model_input, torch.Tensor) else model_input.cache_indices
+        )
+        cache_slots = (
+            None if isinstance(model_input, torch.Tensor) else model_input.cache_slots
+        )
+        cache_ranges = (
+            None if isinstance(model_input, torch.Tensor) else model_input.cache_ranges
+        )
+        past_max_seq_len = (
+            0 if isinstance(model_input, torch.Tensor) else model_input.past_max_seq_len
+        )
         hidden_states = self.embed_tokens(input_ids) * torch.tensor(
             self.embed_scale,
             device=input_ids.device,
@@ -216,6 +237,10 @@ class Gemma4ForCausalLM(nn.Module):
                     sequence_lengths,
                     max_seq_len,
                     kv_cache,
+                    cache_indices,
+                    cache_slots,
+                    cache_ranges,
+                    past_max_seq_len,
                 )
         else:
             offloader.prefetch(0)
@@ -230,14 +255,25 @@ class Gemma4ForCausalLM(nn.Module):
                     sequence_lengths,
                     max_seq_len,
                     kv_cache,
+                    cache_indices,
+                    cache_slots,
+                    cache_ranges,
+                    past_max_seq_len,
                 )
                 offloader.release(layer_index)
                 if not self._offload_prefetch and next_index < len(self.layers):
                     offloader.prefetch(next_index)
         if kv_cache is not None:
-            kv_cache.commit(sequence_lengths, max_seq_len)
+            kv_cache.commit(sequence_lengths, max_seq_len, cache_indices)
         hidden_states = self.norm(hidden_states)
-        if logits_to_keep:
+        if logits_indices is not None:
+            if logits_to_keep:
+                raise ValueError("logits_indices and logits_to_keep are mutually exclusive")
+            if logits_indices.shape != (hidden_states.shape[0],):
+                raise ValueError("logits_indices has an invalid shape")
+            rows = torch.arange(hidden_states.shape[0], device=hidden_states.device)
+            hidden_states = hidden_states[rows, logits_indices].unsqueeze(1)
+        elif logits_to_keep:
             hidden_states = hidden_states[:, -logits_to_keep:]
         logits = F.linear(hidden_states, self.embed_tokens.weight)
         if self.config.final_logit_softcapping is not None:

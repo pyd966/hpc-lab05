@@ -16,7 +16,12 @@ from hpc101_infer.runtime.batch import Batch
 from hpc101_infer.runtime.kv_cache import KVCache
 from hpc101_infer.runtime.metrics import measure_operation
 from hpc101_infer.sampling import Sampler
-from hpc101_infer.scheduler import RequestState, create_scheduler
+from hpc101_infer.scheduler import (
+    ContinuousBatchScheduler,
+    RequestState,
+    RequestStatus,
+    create_scheduler,
+)
 from hpc101_infer.types import (
     DecodeOutput,
     GenerationOutput,
@@ -177,6 +182,112 @@ class InferenceEngine:
             metrics.peak_reserved_bytes,
         )
 
+    @torch.inference_mode()
+    def _prefill_slots(
+        self,
+        input_ids: torch.Tensor,
+        cache_indices: torch.Tensor,
+        cache_slots: tuple[int, ...],
+        prompt_lengths: tuple[int, ...],
+    ) -> PrefillOutput:
+        """Prefill a compact batch into arbitrary stable KV cache slots."""
+        input_ids = self._validate_input_ids(input_ids)
+        batch_size, query_length = input_ids.shape
+        cache_indices = cache_indices.to(device=self.device, dtype=torch.long)
+        if cache_indices.shape != (batch_size,):
+            raise ValueError("cache_indices must match the prefill batch")
+        if len(cache_slots) != batch_size or len(prompt_lengths) != batch_size:
+            raise ValueError("cache slot metadata must match the prefill batch")
+        if any(length <= 0 or length > query_length for length in prompt_lengths):
+            raise ValueError("prompt lengths must be inside the padded prefill batch")
+        sequence_lengths = torch.tensor(
+            prompt_lengths,
+            dtype=torch.long,
+            device=self.device,
+        )
+        cache_ranges = tuple((0, length) for length in prompt_lengths)
+        self.cache.reserve(cache_slots, cache_ranges)
+        positions = torch.arange(query_length, device=self.device).unsqueeze(0)
+        positions = positions.expand(batch_size, -1)
+        model_input = Batch(
+            input_ids=input_ids,
+            positions=positions,
+            sequence_lengths=sequence_lengths,
+            curr_max_seq_len=query_length,
+            mode="prefill",
+            cache_indices=cache_indices,
+            cache_slots=cache_slots,
+            cache_ranges=cache_ranges,
+            past_max_seq_len=0,
+        )
+        with measure_operation(self.device, self.config.synchronize_metrics) as metrics:
+            logits = self.model(
+                model_input,
+                self.cache,
+                logits_indices=sequence_lengths - 1,
+            )
+        return PrefillOutput(
+            logits[:, 0],
+            sequence_lengths.clone(),
+            metrics.latency_s,
+            metrics.peak_allocated_bytes,
+            metrics.peak_reserved_bytes,
+        )
+
+    @torch.inference_mode()
+    def _decode_slots(
+        self,
+        token_ids: torch.Tensor,
+        cache_indices: torch.Tensor,
+        cache_slots: tuple[int, ...],
+        next_lengths_cpu: tuple[int, ...],
+        batch_max_length: int,
+    ) -> DecodeOutput:
+        """Decode one token for a compact set of active stable KV slots."""
+        cache_indices = cache_indices.to(device=self.device, dtype=torch.long)
+        if token_ids.ndim == 1:
+            token_ids = token_ids[:, None]
+        if token_ids.shape != (cache_indices.numel(), 1):
+            raise ValueError("token_ids must match the compact decode batch")
+        if (
+            len(cache_slots) != token_ids.shape[0]
+            or len(next_lengths_cpu) != token_ids.shape[0]
+        ):
+            raise ValueError("cache slot metadata must match the decode batch")
+        if any(length <= 1 for length in next_lengths_cpu):
+            raise ValueError("decode sequence lengths must be greater than one")
+        token_ids = token_ids.to(device=self.device, dtype=torch.long)
+        next_lengths = torch.tensor(
+            next_lengths_cpu,
+            dtype=torch.long,
+            device=self.device,
+        )
+        current_lengths = next_lengths - 1
+        cache_ranges = tuple(
+            (length - 1, length) for length in next_lengths_cpu
+        )
+        self.cache.reserve(cache_slots, cache_ranges)
+        model_input = Batch(
+            input_ids=token_ids,
+            positions=current_lengths[:, None],
+            sequence_lengths=next_lengths,
+            curr_max_seq_len=batch_max_length,
+            mode="decode",
+            cache_indices=cache_indices,
+            cache_slots=cache_slots,
+            cache_ranges=cache_ranges,
+            past_max_seq_len=max(batch_max_length - 1, 0),
+        )
+        with measure_operation(self.device, self.config.synchronize_metrics) as metrics:
+            logits = self.model(model_input, self.cache, logits_to_keep=1)
+        return DecodeOutput(
+            logits[:, -1],
+            next_lengths.clone(),
+            metrics.latency_s,
+            metrics.peak_allocated_bytes,
+            metrics.peak_reserved_bytes,
+        )
+
     def _encode_requests(
         self, requests: list[GenerationRequest]
     ) -> tuple[torch.Tensor, list[list[int]]]:
@@ -217,6 +328,8 @@ class InferenceEngine:
         """对一个静态 batch 执行 prefill、采样和逐 token decode。"""
         if not requests:
             return []
+        if self.config.scheduler_backend == "continuous":
+            return self._generate_continuous(requests)
         if len(requests) > self.config.max_batch_size:
             raise ValueError("request batch exceeds max_batch_size")
 
@@ -327,6 +440,163 @@ class InferenceEngine:
             )
         return outputs
 
+    @torch.inference_mode()
+    def _generate_continuous(
+        self,
+        requests: list[GenerationRequest],
+    ) -> list[GenerationOutput]:
+        """Run an unlimited waiting queue with refillable stable cache slots."""
+        _, encoded = self._encode_requests(requests)
+        states = [
+            RequestState(request=request, prompt_token_ids=prompt_tokens)
+            for request, prompt_tokens in zip(requests, encoded, strict=True)
+        ]
+        state_indices = {id(state): index for index, state in enumerate(states)}
+        scheduler = ContinuousBatchScheduler(
+            max_batch_size=self.config.scheduler_batch_size,
+            prefill_token_budget=self.config.prefill_token_budget,
+            default_stop_token_ids=(self.model.config.eos_token_id,),
+        )
+        for state in states:
+            scheduler.add_request(state)
+
+        self.cache.reset(self.config.max_batch_size)
+        self._batch_size = self.config.max_batch_size
+        prefill_latencies = [0.0] * len(states)
+        decode_latencies: list[list[float]] = [[] for _ in states]
+        completion_times = [0.0] * len(states)
+        peak_allocated = [0] * len(states)
+        peak_reserved = [0] * len(states)
+        started = perf_counter()
+
+        def record_metrics(
+            scheduled_states: list[RequestState],
+            output: PrefillOutput | DecodeOutput,
+            *,
+            decode: bool,
+        ) -> None:
+            for state in scheduled_states:
+                index = state_indices[id(state)]
+                if decode:
+                    decode_latencies[index].append(output.latency_s)
+                else:
+                    prefill_latencies[index] = output.latency_s
+                peak_allocated[index] = max(
+                    peak_allocated[index], output.peak_allocated_bytes
+                )
+                peak_reserved[index] = max(
+                    peak_reserved[index], output.peak_reserved_bytes
+                )
+
+        def finish_and_release(
+            scheduled_states: list[RequestState],
+            completed_slots: tuple[int, ...],
+        ) -> None:
+            if completed_slots:
+                self.cache.release(completed_slots)
+            finished_at = perf_counter() - started
+            for state in scheduled_states:
+                if state.status is RequestStatus.COMPLETED:
+                    completion_times[state_indices[id(state)]] = finished_at
+
+        while scheduler.has_unfinished_requests():
+            # Fill every free slot before the next decode iteration. The token
+            # budget may split admissions into several bounded prefill batches.
+            while scheduler.can_schedule_prefill():
+                schedule = scheduler.schedule_prefill()
+                scheduled_states = [item.request for item in schedule.requests]
+                input_ids = torch.full(
+                    (len(scheduled_states), schedule.batch_max_length),
+                    self.model.config.pad_token_id,
+                    dtype=torch.long,
+                    device=self.device,
+                )
+                for row, state in enumerate(scheduled_states):
+                    input_ids[row, : len(state.prompt_token_ids)] = torch.tensor(
+                        state.prompt_token_ids,
+                        dtype=torch.long,
+                        device=self.device,
+                    )
+                cache_indices = torch.tensor(
+                    schedule.cache_slots,
+                    dtype=torch.long,
+                    device=self.device,
+                )
+                prompt_lengths = tuple(
+                    len(state.prompt_token_ids) for state in scheduled_states
+                )
+                prefill = self._prefill_slots(
+                    input_ids,
+                    cache_indices,
+                    schedule.cache_slots,
+                    prompt_lengths,
+                )
+                record_metrics(scheduled_states, prefill, decode=False)
+                sampling_args = self.sampler.prepare(
+                    [state.request for state in scheduled_states]
+                )
+                next_tokens = self.sampler.sample(prefill.logits, sampling_args)
+                completed = scheduler.update(schedule, next_tokens.tolist())
+                finish_and_release(scheduled_states, completed)
+
+            if not scheduler.has_active_requests():
+                continue
+            schedule = scheduler.schedule_decode()
+            scheduled_states = [item.request for item in schedule.requests]
+            cache_indices = torch.tensor(
+                schedule.cache_slots,
+                dtype=torch.long,
+                device=self.device,
+            )
+            token_ids = torch.tensor(
+                [state.output_token_ids[-1] for state in scheduled_states],
+                dtype=torch.long,
+                device=self.device,
+            )
+            decode = self._decode_slots(
+                token_ids,
+                cache_indices,
+                schedule.cache_slots,
+                tuple(state.num_computed_tokens for state in scheduled_states),
+                schedule.batch_max_length,
+            )
+            record_metrics(scheduled_states, decode, decode=True)
+            sampling_args = self.sampler.prepare(
+                [state.request for state in scheduled_states]
+            )
+            next_tokens = self.sampler.sample(decode.logits, sampling_args)
+            completed = scheduler.update(schedule, next_tokens.tolist())
+            finish_and_release(scheduled_states, completed)
+
+        total_elapsed = perf_counter() - started
+        outputs = []
+        for index, state in enumerate(states):
+            text = (
+                ""
+                if self.tokenizer is None
+                else self.tokenizer.decode(
+                    state.output_token_ids,
+                    skip_special_tokens=True,
+                )
+            )
+            outputs.append(
+                GenerationOutput(
+                    token_ids=state.output_token_ids,
+                    text=text,
+                    prompt_tokens=len(state.prompt_token_ids),
+                    generated_tokens=len(state.output_token_ids),
+                    finish_reason=state.finish_reason,
+                    metrics=RequestMetrics(
+                        prefill_latency_s=prefill_latencies[index],
+                        decode_latencies_s=tuple(decode_latencies[index]),
+                        total_latency_s=completion_times[index] or total_elapsed,
+                        peak_allocated_bytes=peak_allocated[index],
+                        peak_reserved_bytes=peak_reserved[index],
+                    ),
+                )
+            )
+        return outputs
+
     def _validate_loss_mask(
         self,
         loss_mask: torch.Tensor | None,
@@ -422,6 +692,7 @@ class InferenceEngine:
                 sequence_lengths=sequence_lengths,
                 curr_max_seq_len=end,
                 mode="prefill" if start == 0 else "decode",
+                past_max_seq_len=start,
             )
             logits = self.model(model_input, self.cache)
             chunk_logprobs = (

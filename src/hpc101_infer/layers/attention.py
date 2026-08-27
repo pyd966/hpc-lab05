@@ -86,6 +86,10 @@ def _compute_attention(
     max_seq_len: int,
     layer_id: int,
     kv_cache: KVCache | None,
+    cache_indices: torch.Tensor | None,
+    cache_slots: tuple[int, ...] | None,
+    cache_ranges: tuple[tuple[int, int], ...] | None,
+    past_max_seq_len: int,
     *,
     layer_type: str,
     sliding_window: int,
@@ -100,15 +104,28 @@ def _compute_attention(
         and isinstance(layer_cache, PagedLayerKVCache)
         and layer_cache.ring
         and query.shape[2] > 1
-        and kv_cache.committed_max_length > 0
+        and past_max_seq_len > 0
     ):
+        prior_lengths = layer_cache.lengths[: query.shape[0]]
+        if cache_indices is not None:
+            prior_lengths = layer_cache.lengths.index_select(0, cache_indices)
         prior_ring = kv_cache.view(
             layer_id,
-            kv_cache.committed_max_length,
-            layer_cache.lengths[: query.shape[0]],
+            past_max_seq_len,
+            prior_lengths,
+            cache_indices,
         )
     if kv_cache is not None:
-        kv_cache.write(layer_id, position_ids, key, value, sequence_lengths)
+        kv_cache.write(
+            layer_id,
+            position_ids,
+            key,
+            value,
+            sequence_lengths,
+            cache_indices,
+            cache_slots,
+            cache_ranges,
+        )
 
     if attention_backend == "triton_flash":
         from hpc101_infer.kernels.flash_attention import (
@@ -135,11 +152,14 @@ def _compute_attention(
                 sliding_window=sliding_window,
             )
         elif isinstance(layer_cache, PagedLayerKVCache) and not long_ring_prefill:
+            block_table = layer_cache.block_table[: query.shape[0]]
+            if cache_indices is not None:
+                block_table = layer_cache.block_table.index_select(0, cache_indices)
             output = paged_flash_attention(
                 query,
                 layer_cache.key,
                 layer_cache.value,
-                layer_cache.block_table[: query.shape[0]],
+                block_table,
                 position_ids,
                 sequence_lengths,
                 max_key_length=max_seq_len,
@@ -149,7 +169,12 @@ def _compute_attention(
                 sliding_window=sliding_window,
             )
         elif kv_cache is not None and not long_ring_prefill:
-            cached = kv_cache.view(layer_id, max_seq_len, sequence_lengths)
+            cached = kv_cache.view(
+                layer_id,
+                max_seq_len,
+                sequence_lengths,
+                cache_indices,
+            )
             output = flash_attention(
                 query,
                 cached.key,
@@ -173,7 +198,12 @@ def _compute_attention(
 
     cached_key_positions = None
     if kv_cache is not None:
-        cached = kv_cache.view(layer_id, max_seq_len, sequence_lengths)
+        cached = kv_cache.view(
+            layer_id,
+            max_seq_len,
+            sequence_lengths,
+            cache_indices,
+        )
         key, value = cached.key, cached.value
         cached_key_positions = cached.key_positions
     key = repeat_kv(key, num_kv_groups)
@@ -258,6 +288,10 @@ class AttentionLayer(nn.Module):
         max_seq_len: int,
         layer_id: int,
         kv_cache: KVCache | None = None,
+        cache_indices: torch.Tensor | None = None,
+        cache_slots: tuple[int, ...] | None = None,
+        cache_ranges: tuple[tuple[int, int], ...] | None = None,
+        past_max_seq_len: int = 0,
     ) -> torch.Tensor:
         batch, seq_len, _ = hidden_states.shape
         # Projection 后先保持 [batch, sequence, heads, head_dim]，应用 RoPE
@@ -288,6 +322,10 @@ class AttentionLayer(nn.Module):
             max_seq_len,
             layer_id,
             kv_cache,
+            cache_indices,
+            cache_slots,
+            cache_ranges,
+            past_max_seq_len,
             layer_type="full_attention",
             sliding_window=-1,
             num_kv_groups=self.num_kv_groups,
@@ -357,6 +395,10 @@ class SlidingAttentionLayer(nn.Module):
         max_seq_len: int,
         layer_id: int,
         kv_cache: KVCache | None = None,
+        cache_indices: torch.Tensor | None = None,
+        cache_slots: tuple[int, ...] | None = None,
+        cache_ranges: tuple[tuple[int, int], ...] | None = None,
+        past_max_seq_len: int = 0,
     ) -> torch.Tensor:
         batch, seq_len, _ = hidden_states.shape
         # Projection 后先保持 [batch, sequence, heads, head_dim]，应用 RoPE
@@ -387,6 +429,10 @@ class SlidingAttentionLayer(nn.Module):
             max_seq_len,
             layer_id,
             kv_cache,
+            cache_indices,
+            cache_slots,
+            cache_ranges,
+            past_max_seq_len,
             layer_type="sliding_attention",
             sliding_window=self.sliding_window,
             num_kv_groups=self.num_kv_groups,

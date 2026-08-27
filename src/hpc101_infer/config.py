@@ -80,6 +80,7 @@ class EngineConfig:
     attention_backend: str = "eager"
     linear_backend: str = "bf16"
     scheduler_backend: str = "static_batch"
+    prefill_token_budget: int = 2048
     seed: int = 0
     synchronize_metrics: bool = True
     weight_offloading: bool = False
@@ -121,6 +122,7 @@ class EngineConfig:
             "scheduler_batch_size",
             "max_sequence_length",
             "paged_kv_block_size",
+            "prefill_token_budget",
             "seed",
         ):
             value = _optional_integer(raw.get(key), f"config.engine.{key}")
@@ -174,5 +176,7 @@ class EngineConfig:
             raise ValueError(
                 "linear_backend must be bf16, int4_reference, or int4_triton"
             )
-        if self.scheduler_backend != "static_batch":
-            raise ValueError("only the static_batch scheduler is implemented")
+        if self.scheduler_backend not in {"static_batch", "continuous"}:
+            raise ValueError("scheduler_backend must be static_batch or continuous")
+        if self.prefill_token_budget <= 0:
+            raise ValueError("prefill_token_budget must be positive")

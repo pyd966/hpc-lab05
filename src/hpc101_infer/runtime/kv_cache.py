@@ -47,14 +47,28 @@ class LayerKVCache:
         key: torch.Tensor,
         value: torch.Tensor,
         sequence_lengths: torch.Tensor | None = None,
+        batch_indices: torch.Tensor | None = None,
+        batch_slots: tuple[int, ...] | None = None,
+        sequence_ranges: tuple[tuple[int, int], ...] | None = None,
     ) -> None:
         """按绝对 token 位置写入 K/V，Ring 层使用模运算映射物理槽位。"""
         batch_size, query_length = positions.shape
-        if batch_size != self.batch_size:
+        if batch_indices is None and batch_size != self.batch_size:
             raise ValueError(
                 f"positions batch size {batch_size} does not match cache batch "
                 f"size {self.batch_size}"
             )
+        if batch_indices is not None:
+            if batch_indices.shape != (batch_size,):
+                raise ValueError("batch_indices has an invalid shape")
+            if batch_indices.dtype != torch.long:
+                raise TypeError("batch_indices must use torch.long")
+            if batch_indices.device != positions.device:
+                raise ValueError("batch_indices must be on the positions device")
+        if batch_slots is not None and len(batch_slots) != batch_size:
+            raise ValueError("batch_slots must match the input batch")
+        if sequence_ranges is not None and len(sequence_ranges) != batch_size:
+            raise ValueError("sequence_ranges must match the input batch")
         expected_prefix = (batch_size, self.key.shape[1])
         expected_suffix = (query_length, self.key.shape[3])
         if key.shape != expected_prefix + expected_suffix:
@@ -66,7 +80,7 @@ class LayerKVCache:
             raise ValueError(
                 f"invalid value shape {tuple(value.shape)}, expected {tuple(key.shape)}"
             )
-        if positions.numel() and bool((positions < 0).any()):
+        if batch_slots is None and positions.numel() and bool((positions < 0).any()):
             raise ValueError("KV cache positions must be non-negative")
         if sequence_lengths is not None:
             sequence_lengths = sequence_lengths.to(device=positions.device)
@@ -78,14 +92,30 @@ class LayerKVCache:
         if self.ring:
             targets = positions.remainder(self.capacity)
         else:
-            if positions.numel() and bool((positions >= self.capacity).any()):
+            if (
+                batch_slots is None
+                and positions.numel()
+                and bool((positions >= self.capacity).any())
+            ):
                 raise ValueError(
                     f"position exceeds non-ring cache capacity {self.capacity}"
                 )
             targets = positions
         for batch_idx in range(batch_size):
-            source_indices = torch.arange(query_length, device=positions.device)
-            if sequence_lengths is not None:
+            cache_idx = (
+                batch_slots[batch_idx]
+                if batch_slots is not None
+                else batch_idx if batch_indices is None else batch_indices[batch_idx]
+            )
+            if sequence_ranges is not None:
+                start, end = sequence_ranges[batch_idx]
+                source_count = end - start
+                if not 0 <= source_count <= query_length:
+                    raise ValueError("sequence range does not match query length")
+                source_indices = torch.arange(source_count, device=positions.device)
+            else:
+                source_indices = torch.arange(query_length, device=positions.device)
+            if sequence_ranges is None and sequence_lengths is not None:
                 source_indices = source_indices[
                     positions[batch_idx] < sequence_lengths[batch_idx]
                 ]
@@ -102,17 +132,17 @@ class LayerKVCache:
                 # duplicate-index behavior.
                 for source_index in source_indices.tolist():
                     slot = targets[batch_idx, source_index]
-                    self.key[batch_idx, :, slot, :] = key[
+                    self.key[cache_idx, :, slot, :] = key[
                         batch_idx, :, source_index, :
                     ]
-                    self.value[batch_idx, :, slot, :] = value[
+                    self.value[cache_idx, :, slot, :] = value[
                         batch_idx, :, source_index, :
                     ]
                 continue
-            self.key[batch_idx].index_copy_(
+            self.key[cache_idx].index_copy_(
                 1, target, key[batch_idx].index_select(1, source_indices)
             )
-            self.value[batch_idx].index_copy_(
+            self.value[cache_idx].index_copy_(
                 1, target, value[batch_idx].index_select(1, source_indices)
             )
 
@@ -120,13 +150,26 @@ class LayerKVCache:
         self,
         max_length: int,
         sequence_lengths: torch.Tensor | None = None,
+        batch_indices: torch.Tensor | None = None,
     ) -> "LayerKVView":
         """按绝对位置顺序暴露当前 cache 的可见逻辑前缀。"""
         if max_length <= 0:
             raise ValueError("max_length must be positive")
-        batch_size = self.batch_size
+        batch_size = self.batch_size if batch_indices is None else batch_indices.numel()
+        if batch_indices is not None:
+            if batch_indices.ndim != 1 or batch_indices.dtype != torch.long:
+                raise ValueError("batch_indices must be a one-dimensional long tensor")
+            if batch_indices.device != self.key.device:
+                raise ValueError("batch_indices must be on the cache device")
+            selected_key = self.key.index_select(0, batch_indices)
+            selected_value = self.value.index_select(0, batch_indices)
+            stored_lengths = self.lengths.index_select(0, batch_indices)
+        else:
+            selected_key = self.key[:batch_size]
+            selected_value = self.value[:batch_size]
+            stored_lengths = self.lengths[:batch_size]
         if sequence_lengths is None:
-            sequence_lengths = self.lengths[:batch_size]
+            sequence_lengths = stored_lengths
         else:
             sequence_lengths = sequence_lengths.to(device=self.lengths.device)
         if sequence_lengths.shape != (batch_size,):
@@ -151,8 +194,8 @@ class LayerKVCache:
         ).expand(batch_size, -1)
         if not self.ring:
             return LayerKVView(
-                key=self.key[:batch_size, :, :key_length, :],
-                value=self.value[:batch_size, :, :key_length, :],
+                key=selected_key[:, :, :key_length, :],
+                value=selected_value[:, :, :key_length, :],
                 key_positions=key_positions,
             )
 
@@ -163,8 +206,8 @@ class LayerKVCache:
             raise RuntimeError("Ring KV view unexpectedly has zero capacity")
         if bool((logical_start == 0).all()):
             return LayerKVView(
-                key=self.key[:batch_size, :, :key_length, :],
-                value=self.value[:batch_size, :, :key_length, :],
+                key=selected_key[:, :, :key_length, :],
+                value=selected_value[:, :, :key_length, :],
                 key_positions=key_positions,
             )
 
@@ -176,8 +219,8 @@ class LayerKVCache:
             self.key.shape[3],
         )
         return LayerKVView(
-            key=self.key[:batch_size].gather(2, gather_index),
-            value=self.value[:batch_size].gather(2, gather_index),
+            key=selected_key.gather(2, gather_index),
+            value=selected_value.gather(2, gather_index),
             key_positions=key_positions,
         )
 
@@ -188,14 +231,22 @@ class LayerKVCache:
                 raise IndexError("batch index is outside the active cache")
             self.lengths[batch_idx] = 0
 
-    def commit(self, sequence_lengths: torch.Tensor) -> None:
+    def commit(
+        self,
+        sequence_lengths: torch.Tensor,
+        batch_indices: torch.Tensor | None = None,
+    ) -> None:
         """在一次模型 forward 完成后提交新的有效序列长度。"""
-        if sequence_lengths.shape != (self.batch_size,):
+        batch_size = self.batch_size if batch_indices is None else batch_indices.numel()
+        if sequence_lengths.shape != (batch_size,):
             raise ValueError(
-                f"sequence_lengths must have shape ({self.batch_size},), "
+                f"sequence_lengths must have shape ({batch_size},), "
                 f"got {tuple(sequence_lengths.shape)}"
             )
-        self.lengths[: self.batch_size].copy_(sequence_lengths)
+        if batch_indices is None:
+            self.lengths[: self.batch_size].copy_(sequence_lengths)
+        else:
+            self.lengths.index_copy_(0, batch_indices, sequence_lengths)
 
 
 @dataclass
@@ -269,7 +320,13 @@ class PagedLayerKVCache:
         self.block_table.fill_(-1)
         self._reset_allocator()
 
-    def _ensure_block(self, batch_idx: int, logical_block: int) -> None:
+    def _ensure_block(
+        self,
+        batch_idx: int,
+        logical_block: int,
+        *,
+        sync_table: bool = True,
+    ) -> bool:
         if logical_block < 0:
             raise ValueError("logical KV block must be non-negative")
         if self.ring:
@@ -279,7 +336,7 @@ class PagedLayerKVCache:
                 raise ValueError("logical KV block exceeds cache capacity")
             slot = logical_block
         if self._slot_logical[batch_idx][slot] == logical_block:
-            return
+            return False
         old_physical = self._slot_physical[batch_idx][slot]
         if old_physical >= 0:
             self._free_blocks.append(old_physical)
@@ -288,7 +345,9 @@ class PagedLayerKVCache:
         physical = self._free_blocks.pop()
         self._slot_logical[batch_idx][slot] = logical_block
         self._slot_physical[batch_idx][slot] = physical
-        self.block_table[batch_idx, slot] = physical
+        if sync_table:
+            self.block_table[batch_idx, slot] = physical
+        return True
 
     def write(
         self,
@@ -296,21 +355,35 @@ class PagedLayerKVCache:
         key: torch.Tensor,
         value: torch.Tensor,
         sequence_lengths: torch.Tensor | None = None,
+        batch_indices: torch.Tensor | None = None,
+        batch_slots: tuple[int, ...] | None = None,
+        sequence_ranges: tuple[tuple[int, int], ...] | None = None,
     ) -> None:
         """将 K/V 写入逻辑 block 对应的物理 page。"""
         batch_size, query_length = positions.shape
-        if batch_size != self.batch_size:
+        if batch_indices is None and batch_size != self.batch_size:
             raise ValueError(
                 f"positions batch size {batch_size} does not match cache batch "
                 f"size {self.batch_size}"
             )
+        if batch_indices is not None:
+            if batch_indices.shape != (batch_size,):
+                raise ValueError("batch_indices has an invalid shape")
+            if batch_indices.dtype != torch.long:
+                raise TypeError("batch_indices must use torch.long")
+            if batch_indices.device != positions.device:
+                raise ValueError("batch_indices must be on the positions device")
+        if batch_slots is not None and len(batch_slots) != batch_size:
+            raise ValueError("batch_slots must match the input batch")
+        if sequence_ranges is not None and len(sequence_ranges) != batch_size:
+            raise ValueError("sequence_ranges must match the input batch")
         expected = (batch_size, self.key.shape[2], query_length, self.key.shape[3])
         if key.shape != expected or value.shape != expected:
             raise ValueError(
                 f"invalid key/value shape, expected {expected}, got "
                 f"{tuple(key.shape)} and {tuple(value.shape)}"
             )
-        if positions.numel() and bool((positions < 0).any()):
+        if batch_slots is None and positions.numel() and bool((positions < 0).any()):
             raise ValueError("KV cache positions must be non-negative")
         if sequence_lengths is not None:
             sequence_lengths = sequence_lengths.to(device=positions.device)
@@ -327,29 +400,38 @@ class PagedLayerKVCache:
         flat_key = self.key.view(flat_shape)
         flat_value = self.value.view(flat_shape)
         for batch_idx in range(batch_size):
-            source_indices = torch.arange(query_length, device=positions.device)
-            if sequence_lengths is not None:
+            cache_idx = (
+                batch_slots[batch_idx]
+                if batch_slots is not None
+                else batch_idx
+                if batch_indices is None
+                else int(batch_indices[batch_idx].item())
+            )
+            if sequence_ranges is not None:
+                start, end = sequence_ranges[batch_idx]
+                source_count = end - start
+                if not 0 <= source_count <= query_length:
+                    raise ValueError("sequence range does not match query length")
+                source_indices = torch.arange(source_count, device=positions.device)
+            else:
+                source_indices = torch.arange(query_length, device=positions.device)
+            if sequence_ranges is None and sequence_lengths is not None:
                 source_indices = source_indices[
                     positions[batch_idx] < sequence_lengths[batch_idx]
                 ]
-            if self.ring and sequence_lengths is not None:
-                keep_start = max(
-                    int(sequence_lengths[batch_idx].item()) - self.capacity,
-                    0,
-                )
-                source_indices = source_indices[
-                    positions[batch_idx].index_select(0, source_indices) >= keep_start
-                ]
+            if self.ring and source_indices.numel() > self.capacity:
+                source_indices = source_indices[-self.capacity :]
             if source_indices.numel() == 0:
                 continue
             logical_positions = positions[batch_idx].index_select(0, source_indices)
             logical_blocks = logical_positions // self.block_size
-            for logical_block in torch.unique(logical_blocks).tolist():
-                self._ensure_block(batch_idx, int(logical_block))
+            if batch_slots is None:
+                for logical_block in torch.unique(logical_blocks).tolist():
+                    self._ensure_block(cache_idx, int(logical_block))
             page_slots = logical_blocks
             if self.ring:
                 page_slots = page_slots.remainder(self.max_blocks_per_sequence)
-            physical_blocks = self.block_table[batch_idx].index_select(0, page_slots)
+            physical_blocks = self.block_table[cache_idx].index_select(0, page_slots)
             flat_positions = (
                 physical_blocks * self.block_size
                 + logical_positions.remainder(self.block_size)
@@ -363,13 +445,24 @@ class PagedLayerKVCache:
         self,
         max_length: int,
         sequence_lengths: torch.Tensor | None = None,
+        batch_indices: torch.Tensor | None = None,
     ) -> "LayerKVView":
         """按逻辑 token 顺序收集 block，供现有 eager attention 使用。"""
         if max_length <= 0 or max_length > self.max_sequence_length:
             raise ValueError("max_length exceeds paged cache capacity")
-        batch_size = self.batch_size
+        batch_size = self.batch_size if batch_indices is None else batch_indices.numel()
+        if batch_indices is not None:
+            if batch_indices.ndim != 1 or batch_indices.dtype != torch.long:
+                raise ValueError("batch_indices must be a one-dimensional long tensor")
+            if batch_indices.device != self.key.device:
+                raise ValueError("batch_indices must be on the cache device")
+            selected_table = self.block_table.index_select(0, batch_indices)
+            stored_lengths = self.lengths.index_select(0, batch_indices)
+        else:
+            selected_table = self.block_table[:batch_size]
+            stored_lengths = self.lengths[:batch_size]
         if sequence_lengths is None:
-            sequence_lengths = self.lengths[:batch_size]
+            sequence_lengths = stored_lengths
         else:
             sequence_lengths = sequence_lengths.to(device=self.lengths.device)
         if sequence_lengths.shape != (batch_size,):
@@ -406,7 +499,7 @@ class PagedLayerKVCache:
         else:
             logical_positions = offsets.expand(batch_size, -1)
             page_slots = logical_positions // self.block_size
-        physical_blocks = self.block_table.gather(1, page_slots).clamp_min(0)
+        physical_blocks = selected_table.gather(1, page_slots).clamp_min(0)
         flat_positions = (
             physical_blocks * self.block_size
             + logical_positions.remainder(self.block_size)
@@ -441,13 +534,21 @@ class PagedLayerKVCache:
             self.block_table[batch_idx].fill_(-1)
             self.lengths[batch_idx] = 0
 
-    def commit(self, sequence_lengths: torch.Tensor) -> None:
-        if sequence_lengths.shape != (self.batch_size,):
+    def commit(
+        self,
+        sequence_lengths: torch.Tensor,
+        batch_indices: torch.Tensor | None = None,
+    ) -> None:
+        batch_size = self.batch_size if batch_indices is None else batch_indices.numel()
+        if sequence_lengths.shape != (batch_size,):
             raise ValueError(
-                f"sequence_lengths must have shape ({self.batch_size},), "
+                f"sequence_lengths must have shape ({batch_size},), "
                 f"got {tuple(sequence_lengths.shape)}"
             )
-        self.lengths[: self.batch_size].copy_(sequence_lengths)
+        if batch_indices is None:
+            self.lengths[: self.batch_size].copy_(sequence_lengths)
+        else:
+            self.lengths.index_copy_(0, batch_indices, sequence_lengths)
 
 
 @dataclass(frozen=True)
@@ -631,16 +732,73 @@ class KVCache:
         key: torch.Tensor,
         value: torch.Tensor,
         sequence_lengths: torch.Tensor | None = None,
+        batch_indices: torch.Tensor | None = None,
+        batch_slots: tuple[int, ...] | None = None,
+        sequence_ranges: tuple[tuple[int, int], ...] | None = None,
     ) -> None:
-        self.layers[layer_id].write(positions, key, value, sequence_lengths)
+        self.layers[layer_id].write(
+            positions,
+            key,
+            value,
+            sequence_lengths,
+            batch_indices,
+            batch_slots,
+            sequence_ranges,
+        )
+
+    def reserve(
+        self,
+        batch_slots: tuple[int, ...],
+        sequence_ranges: tuple[tuple[int, int], ...],
+    ) -> None:
+        """Reserve every page needed by a compact continuous-batch operation."""
+        if len(batch_slots) != len(sequence_ranges):
+            raise ValueError("batch_slots and sequence_ranges must have equal length")
+        for layer in self.layers:
+            if not isinstance(layer, PagedLayerKVCache):
+                continue
+            table_changed = False
+            for cache_slot, (start, end) in zip(
+                batch_slots, sequence_ranges, strict=True
+            ):
+                if not 0 <= cache_slot < layer.batch_size:
+                    raise IndexError("cache slot is outside the active cache")
+                if not 0 <= start <= end <= layer.max_sequence_length:
+                    raise ValueError("invalid sequence range")
+                if start == end:
+                    continue
+                retained_start = start
+                if layer.ring:
+                    retained_start = max(retained_start, end - layer.capacity)
+                first_block = retained_start // layer.block_size
+                last_block = (end - 1) // layer.block_size
+                for logical_block in range(first_block, last_block + 1):
+                    table_changed |= layer._ensure_block(
+                        cache_slot,
+                        logical_block,
+                        sync_table=False,
+                    )
+            if table_changed:
+                layer.block_table[: layer.batch_size].copy_(
+                    torch.tensor(
+                        layer._slot_physical[: layer.batch_size],
+                        dtype=torch.long,
+                        device=layer.block_table.device,
+                    )
+                )
 
     def view(
         self,
         layer_id: int,
         max_length: int,
         sequence_lengths: torch.Tensor | None = None,
+        batch_indices: torch.Tensor | None = None,
     ) -> LayerKVView:
-        return self.layers[layer_id].view(max_length, sequence_lengths)
+        return self.layers[layer_id].view(
+            max_length,
+            sequence_lengths,
+            batch_indices,
+        )
 
     def release(self, batch_indices: Iterable[int]) -> None:
         indices = tuple(batch_indices)
@@ -651,9 +809,10 @@ class KVCache:
         self,
         sequence_lengths: torch.Tensor,
         max_sequence_length: int | None = None,
+        batch_indices: torch.Tensor | None = None,
     ) -> None:
         for layer in self.layers:
-            layer.commit(sequence_lengths)
+            layer.commit(sequence_lengths, batch_indices)
         if max_sequence_length is None:
             max_sequence_length = int(sequence_lengths.max().item())
         self._committed_max_length = max_sequence_length

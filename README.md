@@ -241,7 +241,8 @@ python3 scripts/run_generation_queue.py \
 | `--max-sequence-length N`                            | 单条请求的 prompt 与生成 token 的最大总长度                                         | `engine.max_sequence_length`，缺省为 `4096`       |
 | `--attention-backend BACKEND`                        | 注意力实现；可选 `eager`、自写 Triton `triton_flash`                               | `engine.attention_backend`，缺省为 `eager`        |
 | `--linear-backend BACKEND`                           | Linear 实现，可选 `bf16`、`int4_reference`、`int4_triton`                         | `engine.linear_backend`，缺省为 `bf16`            |
-| `--scheduler-backend BACKEND`                        | 调度器实现；当前仅支持 `static_batch`                                               | `engine.scheduler_backend`，缺省为 `static_batch` |
+| `--scheduler-backend BACKEND`                        | 调度器实现；可选 `static_batch`、`continuous`                                       | `engine.scheduler_backend`，缺省为 `static_batch` |
+| `--prefill-token-budget N`                           | continuous 每个 prefill batch 的 padded token 上限                                  | `engine.prefill_token_budget`，缺省为 `2048`       |
 | `--max-new-tokens N`                                 | 请求记录未提供 `max_new_tokens` 时使用的默认生成长度；不能从配置文件读取            | `32`                                              |
 | `--seed N`                                           | 采样随机种子                                                                        | `engine.seed`，缺省为 `0`                         |
 | `--synchronize-metrics` / `--no-synchronize-metrics` | 开启或关闭各指标计时区间前后的设备同步                                              | `engine.synchronize_metrics`，缺省为开启          |
@@ -255,6 +256,11 @@ python3 scripts/run_generation_queue.py \
 - `requests_per_s`：每秒完成的请求数；
 - `generated_tokens_per_s`：每秒生成的 token 数；
 - `batch_size`：本次运行使用的 batch size。
+
+`continuous` 模式会一次接收整个输入队列，以固定 KV slot 维护活跃请求。完成请求的
+Paged KV blocks 会立即回收，空出的 slot 在下一次 decode 前由等待队列补位；decode
+只压紧仍活跃的请求。`prefill_token_budget` 按补齐后的 `batch_size * max_prompt_length`
+限制单次 prefill 工作量，至少会接纳一个请求。
 
 实验二的性能指标为 `elapsed_s`，你可以对照实验手册中的得分曲线确认优化效果。
 

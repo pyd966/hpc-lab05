@@ -62,9 +62,10 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--scheduler-backend",
-        choices=("static_batch",),
+        choices=("static_batch", "continuous"),
         default="static_batch",
     )
+    parser.add_argument("--prefill-token-budget", type=int, default=2048)
     parser.add_argument("--max-new-tokens", type=int, default=32)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument(
@@ -123,6 +124,8 @@ def _engine_overrides(
         overrides["linear_backend"] = args.linear_backend
     if _option_is_present(command_line_arguments, "--scheduler-backend"):
         overrides["scheduler_backend"] = args.scheduler_backend
+    if _option_is_present(command_line_arguments, "--prefill-token-budget"):
+        overrides["prefill_token_budget"] = args.prefill_token_budget
     if _option_is_present(command_line_arguments, "--seed"):
         overrides["seed"] = args.seed
     if _boolean_option_is_present(command_line_arguments, "--synchronize-metrics"):
@@ -142,6 +145,7 @@ def _set_engine_argument_values(
     args.attention_backend = config.attention_backend
     args.linear_backend = config.linear_backend
     args.scheduler_backend = config.scheduler_backend
+    args.prefill_token_budget = config.prefill_token_budget
     args.seed = config.seed
     args.synchronize_metrics = config.synchronize_metrics
 
@@ -169,6 +173,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         attention_backend=engine_config.attention_backend,
         linear_backend=engine_config.linear_backend,
         scheduler_backend=engine_config.scheduler_backend,
+        prefill_token_budget=engine_config.prefill_token_budget,
         seed=engine_config.seed,
         synchronize_metrics=engine_config.synchronize_metrics,
     )

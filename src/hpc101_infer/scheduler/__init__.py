@@ -6,6 +6,7 @@ from hpc101_infer.scheduler.base import (
     ScheduledRequest,
     Scheduler,
 )
+from hpc101_infer.scheduler.continuous import ContinuousBatchScheduler
 from hpc101_infer.scheduler.static_batch import StaticBatchScheduler
 
 
@@ -18,6 +19,12 @@ def create_scheduler(
         return StaticBatchScheduler(
             default_stop_token_ids=default_stop_token_ids,
         )
+    if config.scheduler_backend == "continuous":
+        return ContinuousBatchScheduler(
+            max_batch_size=config.scheduler_batch_size,
+            prefill_token_budget=config.prefill_token_budget,
+            default_stop_token_ids=default_stop_token_ids,
+        )
     raise ValueError(f"unsupported scheduler backend: {config.scheduler_backend}")
 
 
@@ -28,5 +35,6 @@ __all__ = [
     "ScheduledRequest",
     "Scheduler",
     "StaticBatchScheduler",
+    "ContinuousBatchScheduler",
     "create_scheduler",
 ]

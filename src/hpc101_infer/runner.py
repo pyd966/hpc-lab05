@@ -108,6 +108,12 @@ class Runner:
         *,
         on_completed: Callable[[int], None] | None = None,
     ) -> list[GenerationOutput]:
+        if self.engine.config.scheduler_backend == "continuous":
+            queued_requests = list(requests)
+            outputs = self.engine.generate(queued_requests)
+            if outputs and on_completed is not None:
+                on_completed(len(outputs))
+            return outputs
         handles = []
         for request in requests:
             handles.append(self.submit(request))

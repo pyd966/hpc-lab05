@@ -13,6 +13,10 @@ class Batch:
     sequence_lengths: torch.Tensor
     mode: Literal["prefill", "decode"]
     curr_max_seq_len: int = 0
+    cache_indices: torch.Tensor | None = None
+    cache_slots: tuple[int, ...] | None = None
+    cache_ranges: tuple[tuple[int, int], ...] | None = None
+    past_max_seq_len: int = 0
 
     @property
     def batch_size(self) -> int:
