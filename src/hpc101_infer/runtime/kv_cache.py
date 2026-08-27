@@ -471,6 +471,7 @@ class KVCache:
         self.layers = layers
         self.max_batch_size = max_batch_size
         self.max_sequence_length = max_sequence_length
+        self._committed_max_length = 0
 
     @classmethod
     def allocate(
@@ -617,6 +618,11 @@ class KVCache:
     def reset(self, batch_size: int) -> None:
         for layer in self.layers:
             layer.reset(batch_size)
+        self._committed_max_length = 0
+
+    @property
+    def committed_max_length(self) -> int:
+        return self._committed_max_length
 
     def write(
         self,
@@ -641,6 +647,13 @@ class KVCache:
         for layer in self.layers:
             layer.release(indices)
 
-    def commit(self, sequence_lengths: torch.Tensor) -> None:
+    def commit(
+        self,
+        sequence_lengths: torch.Tensor,
+        max_sequence_length: int | None = None,
+    ) -> None:
         for layer in self.layers:
             layer.commit(sequence_lengths)
+        if max_sequence_length is None:
+            max_sequence_length = int(sequence_lengths.max().item())
+        self._committed_max_length = max_sequence_length

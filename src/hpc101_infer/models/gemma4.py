@@ -57,6 +57,7 @@ class DecoderLayer(nn.Module):
         config: Gemma4TextConfig,
         layer_idx: int,
         linear_factory: LinearFactory,
+        attention_backend: str = "eager",
     ):
         super().__init__()
         module_prefix = f"layers.{layer_idx}"
@@ -75,6 +76,7 @@ class DecoderLayer(nn.Module):
                     config.attention_k_eq_v,
                     linear_factory,
                     f"{module_prefix}.self_attn",
+                    attention_backend,
                 )
             case "sliding_attention":
                 self.self_attn = SlidingAttentionLayer(
@@ -88,6 +90,7 @@ class DecoderLayer(nn.Module):
                     config.sliding_window,
                     linear_factory,
                     f"{module_prefix}.self_attn",
+                    attention_backend,
                 )
             case _:
                 raise ValueError(f"Unsupported attention type: {self.attn_type}")
@@ -133,6 +136,7 @@ class Gemma4ForCausalLM(nn.Module):
         self,
         config: Gemma4TextConfig,
         linear_factory: LinearFactory | None = None,
+        attention_backend: str = "eager",
     ):
         super().__init__()
         self.config = config
@@ -142,7 +146,7 @@ class Gemma4ForCausalLM(nn.Module):
         )
         self.layers = nn.ModuleList(
             [
-                DecoderLayer(config, idx, linear_factory)
+                DecoderLayer(config, idx, linear_factory, attention_backend)
                 for idx in range(config.num_hidden_layers)
             ]
         )
@@ -231,7 +235,7 @@ class Gemma4ForCausalLM(nn.Module):
                 if not self._offload_prefetch and next_index < len(self.layers):
                     offloader.prefetch(next_index)
         if kv_cache is not None:
-            kv_cache.commit(sequence_lengths)
+            kv_cache.commit(sequence_lengths, max_seq_len)
         hidden_states = self.norm(hidden_states)
         if logits_to_keep:
             hidden_states = hidden_states[:, -logits_to_keep:]

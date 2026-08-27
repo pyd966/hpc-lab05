@@ -239,7 +239,7 @@ python3 scripts/run_generation_queue.py \
 | `--batch-size N`                                     | 调度器每批处理的最大请求数                                                          | `engine.scheduler_batch_size`，缺省为 `1`         |
 | `--max-batch-size N`                                 | KV cache 可容纳的最大 batch；显式设置 `--batch-size` 且未设置本参数时，两者取相同值 | `engine.max_batch_size`，缺省为 `1`               |
 | `--max-sequence-length N`                            | 单条请求的 prompt 与生成 token 的最大总长度                                         | `engine.max_sequence_length`，缺省为 `4096`       |
-| `--attention-backend BACKEND`                        | 注意力实现；当前仅支持 `eager`                                                      | `engine.attention_backend`，缺省为 `eager`        |
+| `--attention-backend BACKEND`                        | 注意力实现；可选 `eager`、自写 Triton `triton_flash`                               | `engine.attention_backend`，缺省为 `eager`        |
 | `--linear-backend BACKEND`                           | Linear 实现，可选 `bf16`、`int4_reference`、`int4_triton`                         | `engine.linear_backend`，缺省为 `bf16`            |
 | `--scheduler-backend BACKEND`                        | 调度器实现；当前仅支持 `static_batch`                                               | `engine.scheduler_backend`，缺省为 `static_batch` |
 | `--max-new-tokens N`                                 | 请求记录未提供 `max_new_tokens` 时使用的默认生成长度；不能从配置文件读取            | `32`                                              |

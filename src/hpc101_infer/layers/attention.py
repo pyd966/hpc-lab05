@@ -9,7 +9,7 @@ from hpc101_infer.layers.linear import BF16LinearFactory, LinearFactory
 from hpc101_infer.layers.norm import RMSNorm
 from hpc101_infer.layers.rotary import RotaryEmbedding
 from hpc101_infer.models.config import RotaryConfig
-from hpc101_infer.runtime.kv_cache import KVCache
+from hpc101_infer.runtime.kv_cache import KVCache, PagedLayerKVCache
 
 
 def make_causal_mask(
@@ -77,6 +77,123 @@ def repeat_kv(hidden_states: torch.Tensor, repeats: int) -> torch.Tensor:
     return expanded.reshape(batch, heads * repeats, seq_len, head_dim)
 
 
+def _compute_attention(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    position_ids: torch.Tensor,
+    sequence_lengths: torch.Tensor,
+    max_seq_len: int,
+    layer_id: int,
+    kv_cache: KVCache | None,
+    *,
+    layer_type: str,
+    sliding_window: int,
+    num_kv_groups: int,
+    attention_backend: str,
+) -> torch.Tensor:
+    """Write KV and dispatch either eager or the self-written Triton path."""
+    layer_cache = kv_cache.layers[layer_id] if kv_cache is not None else None
+    prior_ring = None
+    if (
+        attention_backend == "triton_flash"
+        and isinstance(layer_cache, PagedLayerKVCache)
+        and layer_cache.ring
+        and query.shape[2] > 1
+        and kv_cache.committed_max_length > 0
+    ):
+        prior_ring = kv_cache.view(
+            layer_id,
+            kv_cache.committed_max_length,
+            layer_cache.lengths[: query.shape[0]],
+        )
+    if kv_cache is not None:
+        kv_cache.write(layer_id, position_ids, key, value, sequence_lengths)
+
+    if attention_backend == "triton_flash":
+        from hpc101_infer.kernels.flash_attention import (
+            flash_attention,
+            paged_flash_attention,
+        )
+
+        # A long prefill writes more than one ring capacity in one call. Use the
+        # fresh dense K/V for this call; the ring still retains the newest window
+        # for subsequent decode steps.
+        long_ring_prefill = (
+            isinstance(layer_cache, PagedLayerKVCache)
+            and layer_cache.ring
+            and query.shape[2] > sliding_window
+        )
+        if prior_ring is not None:
+            output = flash_attention(
+                query,
+                torch.cat((prior_ring.key, key), dim=2),
+                torch.cat((prior_ring.value, value), dim=2),
+                position_ids,
+                torch.cat((prior_ring.key_positions, position_ids), dim=1),
+                sequence_lengths,
+                sliding_window=sliding_window,
+            )
+        elif isinstance(layer_cache, PagedLayerKVCache) and not long_ring_prefill:
+            output = paged_flash_attention(
+                query,
+                layer_cache.key,
+                layer_cache.value,
+                layer_cache.block_table[: query.shape[0]],
+                position_ids,
+                sequence_lengths,
+                max_key_length=max_seq_len,
+                block_size=layer_cache.block_size,
+                max_blocks=layer_cache.max_blocks_per_sequence,
+                ring=layer_cache.ring,
+                sliding_window=sliding_window,
+            )
+        elif kv_cache is not None and not long_ring_prefill:
+            cached = kv_cache.view(layer_id, max_seq_len, sequence_lengths)
+            output = flash_attention(
+                query,
+                cached.key,
+                cached.value,
+                position_ids,
+                cached.key_positions,
+                sequence_lengths,
+                sliding_window=sliding_window,
+            )
+        else:
+            output = flash_attention(
+                query,
+                key,
+                value,
+                position_ids,
+                position_ids,
+                sequence_lengths,
+                sliding_window=sliding_window,
+            )
+        return output
+
+    cached_key_positions = None
+    if kv_cache is not None:
+        cached = kv_cache.view(layer_id, max_seq_len, sequence_lengths)
+        key, value = cached.key, cached.value
+        cached_key_positions = cached.key_positions
+    key = repeat_kv(key, num_kv_groups)
+    value = repeat_kv(value, num_kv_groups)
+    scores = torch.matmul(query, key.transpose(2, 3))
+    mask, query_valid = make_attention_mask(
+        positions=position_ids,
+        sequence_lengths=sequence_lengths,
+        key_length=key.shape[2],
+        layer_type=layer_type,
+        dtype=scores.dtype,
+        sliding_window=sliding_window,
+        key_positions=cached_key_positions,
+    )
+    scores = scores + mask
+    prob = torch.softmax(scores, dim=-1, dtype=torch.float32).to(query.dtype)
+    output = torch.matmul(prob, value)
+    return output * query_valid[:, None, :, None]
+
+
 class AttentionLayer(nn.Module):
     def __init__(
         self,
@@ -90,12 +207,14 @@ class AttentionLayer(nn.Module):
         attention_k_eq_v: bool = False,
         linear_factory: LinearFactory | None = None,
         module_prefix: str = "self_attn",
+        attention_backend: str = "eager",
     ):
         super().__init__()
         factory = linear_factory or BF16LinearFactory()
         self.head_dim = head_dim
         self.num_kv_heads = num_kv_heads
         self.num_kv_groups = num_qo_heads // self.num_kv_heads
+        self.attention_backend = attention_backend
         self.q_proj = factory.create(
             f"{module_prefix}.q_proj", hidden_size, num_qo_heads * self.head_dim, False
         )
@@ -160,37 +279,20 @@ class AttentionLayer(nn.Module):
         query = query.transpose(1, 2)
         key = key.transpose(1, 2)
         value = self.v_norm(value).transpose(1, 2)
-        cached_key_positions = None
-        if kv_cache is not None:
-            kv_cache.write(
-                layer_id,
-                position_ids,
-                key,
-                value,
-                sequence_lengths,
-            )
-            cached = kv_cache.view(
-                layer_id,
-                max_seq_len,
-                sequence_lengths,
-            )
-            key, value = cached.key, cached.value
-            cached_key_positions = cached.key_positions
-        key = repeat_kv(key, self.num_kv_groups)
-        value = repeat_kv(value, self.num_kv_groups)
-        scores = torch.matmul(query, key.transpose(2, 3))
-        mask, query_valid = make_attention_mask(
-            positions=position_ids,
-            sequence_lengths=sequence_lengths,
-            key_length=key.shape[2],
+        output = _compute_attention(
+            query,
+            key,
+            value,
+            position_ids,
+            sequence_lengths,
+            max_seq_len,
+            layer_id,
+            kv_cache,
             layer_type="full_attention",
-            dtype=scores.dtype,
-            key_positions=cached_key_positions if kv_cache is not None else None,
-        )
-        scores = scores + mask
-        prob = torch.softmax(scores, dim=-1, dtype=torch.float32).to(query.dtype)
-        output = torch.matmul(prob, value).transpose(1, 2).reshape(batch, seq_len, -1)
-        output = output * query_valid.unsqueeze(-1)
+            sliding_window=-1,
+            num_kv_groups=self.num_kv_groups,
+            attention_backend=self.attention_backend,
+        ).transpose(1, 2).reshape(batch, seq_len, -1)
         return self.o_proj(output)
 
 
@@ -207,6 +309,7 @@ class SlidingAttentionLayer(nn.Module):
         sliding_window: int,
         linear_factory: LinearFactory | None = None,
         module_prefix: str = "self_attn",
+        attention_backend: str = "eager",
     ):
         super().__init__()
         factory = linear_factory or BF16LinearFactory()
@@ -214,6 +317,7 @@ class SlidingAttentionLayer(nn.Module):
         self.num_kv_heads = num_kv_heads
         self.num_kv_groups = num_qo_heads // self.num_kv_heads
         self.sliding_window = sliding_window
+        self.attention_backend = attention_backend
         self.q_proj = factory.create(
             f"{module_prefix}.q_proj", hidden_size, num_qo_heads * self.head_dim, False
         )
@@ -274,36 +378,18 @@ class SlidingAttentionLayer(nn.Module):
         query = query.transpose(1, 2)
         key = key.transpose(1, 2)
         value = self.v_norm(value).transpose(1, 2)
-        cached_key_positions = None
-        if kv_cache is not None:
-            kv_cache.write(
-                layer_id,
-                position_ids,
-                key,
-                value,
-                sequence_lengths,
-            )
-            cached = kv_cache.view(
-                layer_id,
-                max_seq_len,
-                sequence_lengths,
-            )
-            key, value = cached.key, cached.value
-            cached_key_positions = cached.key_positions
-        key = repeat_kv(key, self.num_kv_groups)
-        value = repeat_kv(value, self.num_kv_groups)
-        scores = torch.matmul(query, key.transpose(2, 3))
-        mask, query_valid = make_attention_mask(
-            positions=position_ids,
-            sequence_lengths=sequence_lengths,
-            key_length=key.shape[2],
+        output = _compute_attention(
+            query,
+            key,
+            value,
+            position_ids,
+            sequence_lengths,
+            max_seq_len,
+            layer_id,
+            kv_cache,
             layer_type="sliding_attention",
-            dtype=scores.dtype,
             sliding_window=self.sliding_window,
-            key_positions=cached_key_positions if kv_cache is not None else None,
-        )
-        scores = scores + mask
-        prob = torch.softmax(scores, dim=-1, dtype=torch.float32).to(query.dtype)
-        output = torch.matmul(prob, value).transpose(1, 2).reshape(batch, seq_len, -1)
-        output = output * query_valid.unsqueeze(-1)
+            num_kv_groups=self.num_kv_groups,
+            attention_backend=self.attention_backend,
+        ).transpose(1, 2).reshape(batch, seq_len, -1)
         return self.o_proj(output)

@@ -77,6 +77,7 @@ class InferenceEngine:
             dtype=config.dtype,
             max_position_embeddings=config.max_sequence_length,
             linear_backend=config.linear_backend,
+            attention_backend=config.attention_backend,
         )
         tokenizer = AutoTokenizer.from_pretrained(model_path)
         return cls(model, config, tokenizer)

@@ -50,7 +50,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="KV cache batch capacity. Defaults to --batch-size.",
     )
     parser.add_argument("--max-sequence-length", type=int, default=4096)
-    parser.add_argument("--attention-backend", choices=("eager",), default="eager")
+    parser.add_argument(
+        "--attention-backend",
+        choices=("eager", "triton_flash"),
+        default="eager",
+    )
     parser.add_argument(
         "--linear-backend",
         choices=("bf16", "int4_reference", "int4_triton"),

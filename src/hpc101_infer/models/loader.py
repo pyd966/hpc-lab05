@@ -81,6 +81,7 @@ def load_gemma4(
     dtype: torch.dtype = torch.bfloat16,
     max_position_embeddings: int | None = None,
     linear_backend: str = "bf16",
+    attention_backend: str = "eager",
 ) -> Gemma4ForCausalLM:
     """在 meta device 构造模型，再逐 tensor 加载到目标设备。
 
@@ -121,7 +122,11 @@ def load_gemma4(
 
     # meta model 只记录结构和 shape，不为完整模型分配真实权重存储。
     with torch.device("meta"):
-        model = Gemma4ForCausalLM(config, linear_factory=linear_factory)
+        model = Gemma4ForCausalLM(
+            config,
+            linear_factory=linear_factory,
+            attention_backend=attention_backend,
+        )
 
     expected = set(model.state_dict())
     loaded: set[str] = set()

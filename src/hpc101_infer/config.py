@@ -168,8 +168,8 @@ class EngineConfig:
             self.paged_kv_block_size & (self.paged_kv_block_size - 1)
         ):
             raise ValueError("paged_kv_block_size must be a power of two greater than 1")
-        if self.attention_backend != "eager":
-            raise ValueError("only the eager attention backend is implemented")
+        if self.attention_backend not in {"eager", "triton_flash"}:
+            raise ValueError("attention_backend must be eager or triton_flash")
         if self.linear_backend not in {"bf16", "int4_reference", "int4_triton"}:
             raise ValueError(
                 "linear_backend must be bf16, int4_reference, or int4_triton"

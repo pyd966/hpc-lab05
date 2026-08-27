@@ -231,6 +231,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--dtype", choices=DTYPES, default="bfloat16")
     parser.add_argument(
+        "--attention-backend",
+        choices=("eager", "triton_flash"),
+        default="eager",
+    )
+    parser.add_argument(
         "--linear-backend",
         choices=("bf16", "int4_reference", "int4_triton"),
         default="int4_reference",
@@ -285,6 +290,7 @@ def main() -> None:
             max_batch_size=1,
             scheduler_batch_size=1,
             max_sequence_length=args.max_sequence_length,
+            attention_backend=args.attention_backend,
             linear_backend=args.linear_backend,
         ),
     )
@@ -310,6 +316,7 @@ def main() -> None:
     result: dict[str, Any] = {
         "schema_version": 2,
         "model": str(args.model),
+        "attention_backend": args.attention_backend,
         "linear_backend": args.linear_backend,
         "dataset": str(args.dataset),
         "dataset_sha256": _dataset_sha256(args.dataset),
