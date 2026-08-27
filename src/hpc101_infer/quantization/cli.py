@@ -142,6 +142,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--max-shard-size-mib", type=int, default=1024)
     parser.add_argument(
+        "--force",
+        action="store_true",
+        help="忽略已有量化缓存并重新计算 checkpoint",
+    )
+    parser.add_argument(
         "--calibration-file", help="path to calibration JSONL text file"
     )
     parser.add_argument(
@@ -309,8 +314,12 @@ def main() -> None:
         device=args.device,
         max_shard_size_bytes=args.max_shard_size_mib * 1024 * 1024,
         print_layer_loss=args.verbose,
+        reuse_cache=not args.force,
     )
-    print(f"quantized {len(manifest)} Linear modules into {args.output}")
+    if args.force:
+        print(f"已重新量化 {len(manifest)} 个 Linear 模块，结果保存到 {args.output}")
+    else:
+        print(f"量化结果已准备好：{len(manifest)} 个 Linear 模块，目录 {args.output}")
 
 
 if __name__ == "__main__":

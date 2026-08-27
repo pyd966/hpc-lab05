@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
-from typing import Iterable, Protocol
+from typing import Any, Iterable, Protocol
 
 import torch
 from safetensors import safe_open
@@ -13,6 +14,177 @@ from hpc101_infer.quantization.types import (
     QuantizedModuleManifest,
     TensorMetadata,
 )
+
+
+QUANTIZATION_CACHE_FILENAME = "quantization_cache.json"
+_QUANTIZATION_CACHE_VERSION = 2
+
+
+def _source_file_signatures(model_path: Path) -> list[dict[str, Any]]:
+    """Return cheap, deterministic signatures for files affecting a source checkpoint."""
+    if not model_path.is_dir():
+        raise NotADirectoryError(model_path)
+    signatures = []
+    for path in sorted(model_path.rglob("*")):
+        if not path.is_file():
+            continue
+        stat = path.stat()
+        signatures.append(
+            {
+                "path": path.relative_to(model_path).as_posix(),
+                "size": stat.st_size,
+                "mtime_ns": stat.st_mtime_ns,
+                "ctime_ns": stat.st_ctime_ns,
+                "inode": stat.st_ino,
+            }
+        )
+    return signatures
+
+
+def _calibration_signature(
+    calibration_input_ids: torch.Tensor | None,
+) -> dict[str, Any] | None:
+    if calibration_input_ids is None:
+        return None
+    tensor = calibration_input_ids.detach().cpu().contiguous()
+    digest = hashlib.sha256(tensor.numpy().tobytes()).hexdigest()
+    return {
+        "shape": list(tensor.shape),
+        "dtype": str(tensor.dtype),
+        "sha256": digest,
+    }
+
+
+def quantization_cache_key(
+    source_model_path: str | Path,
+    config: QuantizationConfig,
+    *,
+    calibration_input_ids: torch.Tensor | None,
+    calibration_micro_batch_size: int,
+    max_calibration_tokens: int,
+    max_shard_size_bytes: int,
+) -> str:
+    """Build a key for all inputs that can change the serialized quantized model."""
+    source_path = Path(source_model_path).expanduser().resolve()
+    payload = {
+        "version": _QUANTIZATION_CACHE_VERSION,
+        "source_path": str(source_path),
+        "source_files": _source_file_signatures(source_path),
+        "quantization_config": config.to_dict(),
+        "calibration": _calibration_signature(calibration_input_ids),
+        "calibration_micro_batch_size": calibration_micro_batch_size,
+        "max_calibration_tokens": max_calibration_tokens,
+        "max_shard_size_bytes": max_shard_size_bytes,
+    }
+    encoded = json.dumps(
+        payload,
+        ensure_ascii=True,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _cache_artifact_signatures(output_dir: Path) -> list[dict[str, Any]]:
+    names = {
+        "config.json",
+        "manifest.json",
+        "quantization_config.json",
+        "model.safetensors.index.json",
+    }
+    names.update(path.name for path in output_dir.glob("model-*.safetensors"))
+    signatures = []
+    for name in sorted(names):
+        path = output_dir / name
+        if not path.is_file():
+            continue
+        stat = path.stat()
+        signatures.append(
+            {
+                "path": name,
+                "size": stat.st_size,
+                "mtime_ns": stat.st_mtime_ns,
+                "ctime_ns": stat.st_ctime_ns,
+                "inode": stat.st_ino,
+            }
+        )
+    return signatures
+
+
+def write_quantization_cache(output_dir: str | Path, cache_key: str) -> None:
+    output_path = Path(output_dir)
+    metadata = {
+        "format_version": _QUANTIZATION_CACHE_VERSION,
+        "cache_key": cache_key,
+        "artifacts": _cache_artifact_signatures(output_path),
+    }
+    cache_path = output_path / QUANTIZATION_CACHE_FILENAME
+    temporary_path = cache_path.with_suffix(".tmp")
+    temporary_path.write_text(json.dumps(metadata, indent=2, sort_keys=True) + "\n")
+    temporary_path.replace(cache_path)
+
+
+def load_quantization_cache(
+    output_dir: str | Path,
+    cache_key: str,
+) -> dict[str, QuantizedModuleManifest] | None:
+    """Load a completed checkpoint when its inputs and artifacts match."""
+    output_path = Path(output_dir)
+    cache_path = output_path / QUANTIZATION_CACHE_FILENAME
+    if not cache_path.is_file():
+        return None
+    try:
+        metadata = json.loads(cache_path.read_text())
+        if not isinstance(metadata, dict):
+            return None
+        if metadata.get("format_version") != _QUANTIZATION_CACHE_VERSION:
+            return None
+        if metadata.get("cache_key") != cache_key:
+            return None
+        artifacts = metadata.get("artifacts")
+        if not isinstance(artifacts, list) or not artifacts:
+            return None
+        artifact_names = {
+            artifact.get("path")
+            for artifact in artifacts
+            if isinstance(artifact, dict)
+        }
+        required_names = {
+            "config.json",
+            "manifest.json",
+            "quantization_config.json",
+            "model.safetensors.index.json",
+        }
+        if not required_names.issubset(artifact_names):
+            return None
+        for artifact in artifacts:
+            if not isinstance(artifact, dict):
+                return None
+            artifact_name = artifact["path"]
+            if not isinstance(artifact_name, str) or Path(artifact_name).name != artifact_name:
+                return None
+            path = output_path / artifact_name
+            stat = path.stat()
+            if (
+                stat.st_size != artifact["size"]
+                or stat.st_mtime_ns != artifact["mtime_ns"]
+                or stat.st_ctime_ns != artifact["ctime_ns"]
+                or stat.st_ino != artifact["inode"]
+            ):
+                return None
+        source = QuantizedCheckpointSource(output_path)
+    except (
+        OSError,
+        KeyError,
+        TypeError,
+        ValueError,
+        IndexError,
+        AttributeError,
+        RuntimeError,
+        json.JSONDecodeError,
+    ):
+        return None
+    return dict(source.manifest)
 
 
 class CheckpointSource(Protocol):

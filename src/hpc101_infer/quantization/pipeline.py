@@ -19,6 +19,9 @@ from hpc101_infer.quantization.calibration import ActivationCapture, Calibration
 from hpc101_infer.quantization.checkpoint import (
     CheckpointWriter,
     HFSafetensorsSource,
+    load_quantization_cache,
+    quantization_cache_key,
+    write_quantization_cache,
 )
 from hpc101_infer.quantization.config import QuantizationConfig
 from hpc101_infer.quantization.packing import dequantize_weight
@@ -579,13 +582,29 @@ def quantize_checkpoint(
     print_layer_loss: bool = False,
     device: str | torch.device = "cpu",
     max_shard_size_bytes: int = 1 << 30,
+    reuse_cache: bool = True,
 ) -> dict[str, QuantizedModuleManifest]:
     """Quantize a checkpoint, optionally printing per-layer output MSE.
 
     ``print_layer_loss`` compares each layer's original and fake-quantized
-    outputs, so it requires ``calibration_input_ids``.
+    outputs, so it requires ``calibration_input_ids``. By default, a matching
+    completed checkpoint is loaded from ``output_dir`` instead of re-running
+    quantization; set ``reuse_cache=False`` to force recomputation.
     """
-    return QuantizationPipeline(
+    cache_key = quantization_cache_key(
+        source_model_path,
+        config,
+        calibration_input_ids=calibration_input_ids,
+        calibration_micro_batch_size=calibration_micro_batch_size,
+        max_calibration_tokens=max_calibration_tokens,
+        max_shard_size_bytes=max_shard_size_bytes,
+    )
+    if reuse_cache:
+        cached_manifest = load_quantization_cache(output_dir, cache_key)
+        if cached_manifest is not None:
+            return cached_manifest
+
+    manifest = QuantizationPipeline(
         source_model_path,
         output_dir,
         config,
@@ -597,3 +616,5 @@ def quantize_checkpoint(
         device=device,
         max_shard_size_bytes=max_shard_size_bytes,
     ).run()
+    write_quantization_cache(output_dir, cache_key)
+    return manifest

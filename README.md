@@ -124,8 +124,20 @@ python3 scripts/quantize.py \
 | `--gptq-block-size`        | GPTQ 分块处理的列数                    | `128`     |
 | `--gptq-damp-percent`      | Hessian 阻尼比例                       | `0.01`    |
 | `--max-shard-size-mib`     | 输出权重分片的大小上限                 | `1024`    |
+| `--force`                  | 忽略已有缓存并强制重新量化             | 关闭      |
 
-量化完成后，`QUANT_DIR` 中会保存 packed INT4 权重、量化配置和 manifest。不要覆盖原始 BF16 checkpoint。
+量化完成后，`QUANT_DIR` 中会保存 packed INT4 权重、量化配置、manifest 和 `quantization_cache.json`。不要覆盖原始 BF16 checkpoint。
+
+量化脚本默认复用 `QUANT_DIR` 中的有效缓存，不会再次执行逐层校准和 GPTQ。缓存键会检查源 checkpoint 文件签名、量化配置、校准 token 内容、校准批大小、激活值上限和分片大小；输出分片及 manifest 被修改或缺失时也会自动失效。首次量化成功后，重复执行上面的命令只需完成轻量元数据校验即可加载结果。需要强制重新量化时显式增加 `--force`：
+
+```bash
+python3 scripts/quantize.py \
+  --config config.yaml \
+  --model "$MODEL_DIR" \
+  --output "$QUANT_DIR" \
+  --device cuda \
+  --force
+```
 
 如果量化时显存不足，优先减小 `--max-calibration-tokens`，并保持 `--calibration-micro-batch-size 1`。修改参数后应重新进行精度评测。
 
