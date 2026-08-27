@@ -57,6 +57,7 @@ class InferenceEngine:
             config.max_sequence_length,
             config.dtype,
             self.device,
+            ring_kv_cache=config.ring_kv_cache,
         )
         self.sampler = Sampler(self.device, self.model.config.vocab_size)
         self._batch_size = 0

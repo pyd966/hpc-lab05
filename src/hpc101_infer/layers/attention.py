@@ -37,14 +37,23 @@ def make_attention_mask(
     layer_type: str,
     dtype: torch.dtype,
     sliding_window: int = -1,
+    key_positions: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """同时屏蔽未来 token、padding token 和滑动窗口外的历史 token。"""
-    key_positions = torch.arange(key_length, device=positions.device)
+    if key_positions is None:
+        key_positions = torch.arange(key_length, device=positions.device)
+    if key_positions.ndim == 1:
+        if key_positions.shape != (key_length,):
+            raise ValueError("key_positions has an invalid shape")
+        key_positions = key_positions.expand(positions.shape[0], -1)
+    elif key_positions.shape != (positions.shape[0], key_length):
+        raise ValueError("key_positions has an invalid shape")
+    key_positions = key_positions.to(device=positions.device)
     query_valid = positions < sequence_lengths[:, None]
-    allowed = key_positions[None, None, :] <= positions[:, :, None]
-    allowed &= key_positions[None, None, :] < sequence_lengths[:, None, None]
+    allowed = key_positions[:, None, :] <= positions[:, :, None]
+    allowed &= key_positions[:, None, :] < sequence_lengths[:, None, None]
     if layer_type == "sliding_attention":
-        allowed &= key_positions[None, None, :] > (
+        allowed &= key_positions[:, None, :] > (
             positions[:, :, None] - sliding_window
         )
     allowed &= query_valid[:, :, None]
@@ -151,10 +160,22 @@ class AttentionLayer(nn.Module):
         query = query.transpose(1, 2)
         key = key.transpose(1, 2)
         value = self.v_norm(value).transpose(1, 2)
+        cached_key_positions = None
         if kv_cache is not None:
-            kv_cache.write(layer_id, position_ids, key, value)
-            cached = kv_cache.view(layer_id, max_seq_len)
+            kv_cache.write(
+                layer_id,
+                position_ids,
+                key,
+                value,
+                sequence_lengths,
+            )
+            cached = kv_cache.view(
+                layer_id,
+                max_seq_len,
+                sequence_lengths,
+            )
             key, value = cached.key, cached.value
+            cached_key_positions = cached.key_positions
         key = repeat_kv(key, self.num_kv_groups)
         value = repeat_kv(value, self.num_kv_groups)
         scores = torch.matmul(query, key.transpose(2, 3))
@@ -164,6 +185,7 @@ class AttentionLayer(nn.Module):
             key_length=key.shape[2],
             layer_type="full_attention",
             dtype=scores.dtype,
+            key_positions=cached_key_positions if kv_cache is not None else None,
         )
         scores = scores + mask
         prob = torch.softmax(scores, dim=-1, dtype=torch.float32).to(query.dtype)
@@ -252,10 +274,22 @@ class SlidingAttentionLayer(nn.Module):
         query = query.transpose(1, 2)
         key = key.transpose(1, 2)
         value = self.v_norm(value).transpose(1, 2)
+        cached_key_positions = None
         if kv_cache is not None:
-            kv_cache.write(layer_id, position_ids, key, value)
-            cached = kv_cache.view(layer_id, max_seq_len)
+            kv_cache.write(
+                layer_id,
+                position_ids,
+                key,
+                value,
+                sequence_lengths,
+            )
+            cached = kv_cache.view(
+                layer_id,
+                max_seq_len,
+                sequence_lengths,
+            )
             key, value = cached.key, cached.value
+            cached_key_positions = cached.key_positions
         key = repeat_kv(key, self.num_kv_groups)
         value = repeat_kv(value, self.num_kv_groups)
         scores = torch.matmul(query, key.transpose(2, 3))
@@ -266,6 +300,7 @@ class SlidingAttentionLayer(nn.Module):
             layer_type="sliding_attention",
             dtype=scores.dtype,
             sliding_window=self.sliding_window,
+            key_positions=cached_key_positions if kv_cache is not None else None,
         )
         scores = scores + mask
         prob = torch.softmax(scores, dim=-1, dtype=torch.float32).to(query.dtype)

@@ -85,6 +85,7 @@ class EngineConfig:
     weight_offloading: bool = False
     weight_offloading_prefetch: bool = True
     weight_offloading_pin_memory: bool = True
+    ring_kv_cache: bool = True
 
     @classmethod
     def from_mapping(cls, raw: Mapping[str, object]) -> EngineConfig:
@@ -134,6 +135,7 @@ class EngineConfig:
             "weight_offloading",
             "weight_offloading_prefetch",
             "weight_offloading_pin_memory",
+            "ring_kv_cache",
         ):
             value = _optional_boolean(raw.get(key), f"config.engine.{key}")
             if value is not None:
