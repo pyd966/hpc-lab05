@@ -8,21 +8,33 @@ import torch
 from torch import nn
 
 
-@dataclass
+@dataclass(frozen=True)
 class _TensorSlot:
     owner: nn.Module
     name: str
-    host: torch.Tensor
+    offset: int
+    nbytes: int
+    shape: tuple[int, ...]
+    dtype: torch.dtype
     parameter: bool
     requires_grad: bool
 
 
-class AsyncLayerOffloader:
-    """在独立 CUDA stream 上预取/回收 decoder layer 的权重。
+@dataclass(frozen=True)
+class _LayerPayload:
+    host: torch.Tensor
+    slots: tuple[_TensorSlot, ...]
 
-    每次最多让当前层和下一层同时驻留 GPU。CPU 侧 tensor 使用 pinned
-    memory，计算流通过 CUDA Event 等待 H2D 拷贝完成。
+
+class AsyncLayerOffloader:
+    """用两个可复用 GPU buffer 异步搬运逐层权重。
+
+    每层的参数和 buffer 先合并到一个连续的 CPU byte payload。传输流在
+    计算当前层时预取下一层；计算流通过 ready event 等待 H2D 完成。推理
+    权重是只读的，因此释放层时只切回 CPU 视图，不再做无意义的 D2H 回拷。
     """
+
+    _BUFFER_SLOTS = 2
 
     def __init__(
         self,
@@ -40,29 +52,42 @@ class AsyncLayerOffloader:
         if not self.layers:
             raise ValueError("at least one layer is required")
 
-        self._slots: list[list[_TensorSlot]] = []
-        self._resident = [False] * len(self.layers)
         self._non_blocking = pin_memory
-        self.host_to_device_bytes = 0
-        self.device_to_host_bytes = 0
-
-        for layer in self.layers:
-            slots = self._collect_slots(layer, pin_memory=pin_memory)
-            if not slots:
-                raise ValueError("each offloaded layer must contain tensors")
-            self._slots.append(slots)
-
+        self._payloads = [
+            self._pack_layer(layer, pin_memory=pin_memory) for layer in self.layers
+        ]
+        self._buffer_bytes = max(payload.host.numel() for payload in self._payloads)
         with torch.cuda.device(self.device):
+            self._device_buffers = [
+                torch.empty(
+                    self._buffer_bytes,
+                    dtype=torch.uint8,
+                    device=self.device,
+                )
+                for _ in range(self._BUFFER_SLOTS)
+            ]
             self.transfer_stream = torch.cuda.Stream(device=self.device)
             self._ready_events = [torch.cuda.Event() for _ in self.layers]
 
-    @staticmethod
-    def _collect_slots(
+        self._resident = [False] * len(self.layers)
+        self._layer_buffer: list[int | None] = [None] * len(self.layers)
+        self._buffer_layer: list[int | None] = [None] * self._BUFFER_SLOTS
+        self._buffer_reuse_events: list[torch.cuda.Event | None] = [
+            None
+        ] * self._BUFFER_SLOTS
+        self.host_to_device_bytes = 0
+        self.device_to_host_bytes = 0
+        self._prefetch_calls = 0
+
+    @classmethod
+    def _pack_layer(
+        cls,
         layer: nn.Module,
         *,
         pin_memory: bool,
-    ) -> list[_TensorSlot]:
-        slots: list[_TensorSlot] = []
+    ) -> _LayerPayload:
+        """将一层的所有 tensor 合并为一个按字节寻址的连续 payload。"""
+        entries: list[tuple[nn.Module, str, torch.Tensor, bool, bool]] = []
         for owner in layer.modules():
             for name, parameter in tuple(owner._parameters.items()):
                 if parameter is None:
@@ -72,16 +97,8 @@ class AsyncLayerOffloader:
                         "offloaded layer parameters must start on CPU, "
                         f"got {parameter.device} for {name}"
                     )
-                if pin_memory and not parameter.is_pinned():
-                    parameter.data = parameter.detach().pin_memory()
-                slots.append(
-                    _TensorSlot(
-                        owner=owner,
-                        name=name,
-                        host=parameter,
-                        parameter=True,
-                        requires_grad=parameter.requires_grad,
-                    )
+                entries.append(
+                    (owner, name, parameter, True, parameter.requires_grad)
                 )
             for name, buffer in tuple(owner._buffers.items()):
                 if buffer is None:
@@ -91,95 +108,103 @@ class AsyncLayerOffloader:
                         "offloaded layer buffers must start on CPU, "
                         f"got {buffer.device} for {name}"
                     )
-                if pin_memory and not buffer.is_pinned():
-                    buffer = buffer.pin_memory()
-                    owner._buffers[name] = buffer
-                slots.append(
-                    _TensorSlot(
-                        owner=owner,
-                        name=name,
-                        host=buffer,
-                        parameter=False,
-                        requires_grad=False,
-                    )
-                )
-        return slots
+                entries.append((owner, name, buffer, False, False))
 
-    def _is_target_device(self, device: torch.device) -> bool:
-        return device.type == self.device.type and (
-            self.device.index is None or device.index == self.device.index
-        )
+        if not entries:
+            raise ValueError("each offloaded layer must contain tensors")
+
+        offset = 0
+        descriptors: list[_TensorSlot] = []
+        for owner, name, tensor, parameter, requires_grad in entries:
+            itemsize = tensor.element_size()
+            offset = (offset + itemsize - 1) // itemsize * itemsize
+            nbytes = tensor.numel() * itemsize
+            descriptors.append(
+                _TensorSlot(
+                    owner=owner,
+                    name=name,
+                    offset=offset,
+                    nbytes=nbytes,
+                    shape=tuple(tensor.shape),
+                    dtype=tensor.dtype,
+                    parameter=parameter,
+                    requires_grad=requires_grad,
+                )
+            )
+            offset += nbytes
+
+        host = torch.empty(offset, dtype=torch.uint8, pin_memory=pin_memory)
+        for descriptor, (_, _, tensor, _, _) in zip(
+            descriptors, entries, strict=True
+        ):
+            source = tensor.detach().contiguous().view(torch.uint8).reshape(-1)
+            host[
+                descriptor.offset : descriptor.offset + descriptor.nbytes
+            ].copy_(source)
+
+        for descriptor in descriptors:
+            cls._assign_tensor(descriptor, host)
+        return _LayerPayload(host=host, slots=tuple(descriptors))
 
     @staticmethod
-    def _current(slot: _TensorSlot) -> torch.Tensor:
-        if slot.parameter:
-            tensor = slot.owner._parameters[slot.name]
-        else:
-            tensor = slot.owner._buffers[slot.name]
-        if tensor is None:
-            raise RuntimeError(f"offloaded tensor disappeared: {slot.name}")
-        return tensor
-
-    def _move_to_device(self, slot: _TensorSlot) -> None:
-        current = self._current(slot)
-        if self._is_target_device(current.device):
-            return
-        if current.device.type != "cpu":
-            raise RuntimeError(
-                f"cannot prefetch tensor from {current.device}; expected CPU"
-            )
-        moved = current.detach().to(
-            device=self.device,
-            non_blocking=self._non_blocking,
+    def _view(storage: torch.Tensor, descriptor: _TensorSlot) -> torch.Tensor:
+        byte_view = storage.narrow(
+            0,
+            descriptor.offset,
+            descriptor.nbytes,
         )
-        if slot.parameter:
-            slot.owner._parameters[slot.name] = nn.Parameter(
-                moved,
-                requires_grad=slot.requires_grad,
-            )
-        else:
-            slot.owner._buffers[slot.name] = moved
-        self.host_to_device_bytes += moved.numel() * moved.element_size()
+        return byte_view.view(descriptor.dtype).reshape(descriptor.shape)
 
-    def _move_to_host(self, slot: _TensorSlot) -> None:
-        current = self._current(slot)
-        if current.device.type == "cpu":
-            return
-        if not self._is_target_device(current.device):
-            raise RuntimeError(
-                f"cannot release tensor on {current.device}; expected {self.device}"
+    @classmethod
+    def _assign_tensor(
+        cls,
+        descriptor: _TensorSlot,
+        storage: torch.Tensor,
+    ) -> None:
+        tensor = cls._view(storage, descriptor)
+        if descriptor.parameter:
+            descriptor.owner._parameters[descriptor.name] = nn.Parameter(
+                tensor,
+                requires_grad=descriptor.requires_grad,
             )
-        if slot.host.is_pinned():
-            if slot.parameter:
-                slot.host.data.copy_(current.detach(), non_blocking=True)
-                slot.owner._parameters[slot.name] = slot.host
-            else:
-                slot.host.copy_(current.detach(), non_blocking=True)
-                slot.owner._buffers[slot.name] = slot.host
-            current.record_stream(self.transfer_stream)
         else:
-            # Pageable CPU memory cannot be the destination of an asynchronous
-            # D2H copy. Keep this configuration correct with a synchronous copy.
-            moved = current.detach().to(device="cpu")
-            if slot.parameter:
-                slot.owner._parameters[slot.name] = nn.Parameter(
-                    moved,
-                    requires_grad=slot.requires_grad,
-                )
-            else:
-                slot.owner._buffers[slot.name] = moved
-        self.device_to_host_bytes += current.numel() * current.element_size()
+            descriptor.owner._buffers[descriptor.name] = tensor
+
+    def _choose_buffer(self) -> int:
+        for buffer_index, layer_index in enumerate(self._buffer_layer):
+            if layer_index is None:
+                return buffer_index
+        raise RuntimeError(
+            "both GPU weight buffers are resident; release a layer before "
+            "prefetching another one"
+        )
 
     def prefetch(self, layer_index: int) -> None:
         if not 0 <= layer_index < len(self.layers):
             raise IndexError(layer_index)
         if self._resident[layer_index]:
             return
+
+        buffer_index = self._choose_buffer()
+        payload = self._payloads[layer_index]
+        buffer = self._device_buffers[buffer_index]
         with torch.cuda.stream(self.transfer_stream):
-            for slot in self._slots[layer_index]:
-                self._move_to_device(slot)
+            reuse_event = self._buffer_reuse_events[buffer_index]
+            if reuse_event is not None:
+                self.transfer_stream.wait_event(reuse_event)
+            buffer[: payload.host.numel()].copy_(
+                payload.host,
+                non_blocking=self._non_blocking,
+            )
+            for descriptor in payload.slots:
+                self._assign_tensor(descriptor, buffer)
             self._ready_events[layer_index].record(self.transfer_stream)
+
         self._resident[layer_index] = True
+        self._layer_buffer[layer_index] = buffer_index
+        self._buffer_layer[buffer_index] = layer_index
+        self._prefetch_calls += 1
+        self.host_to_device_bytes += payload.host.numel()
 
     def wait(self, layer_index: int) -> None:
         if not 0 <= layer_index < len(self.layers):
@@ -195,12 +220,20 @@ class AsyncLayerOffloader:
             raise IndexError(layer_index)
         if not self._resident[layer_index]:
             return
+
+        buffer_index = self._layer_buffer[layer_index]
+        if buffer_index is None:
+            raise RuntimeError(f"layer {layer_index} has no GPU buffer")
+        # 所有前向权重都是只读的；记录计算完成后即可安全复用 buffer，
+        # 不需要把相同数据再拷回 CPU。
         compute_done = torch.cuda.Event()
         compute_done.record(torch.cuda.current_stream(self.device))
-        with torch.cuda.stream(self.transfer_stream):
-            self.transfer_stream.wait_event(compute_done)
-            for slot in self._slots[layer_index]:
-                self._move_to_host(slot)
+        for descriptor in self._payloads[layer_index].slots:
+            self._assign_tensor(descriptor, self._payloads[layer_index].host)
+
+        self._buffer_reuse_events[buffer_index] = compute_done
+        self._buffer_layer[buffer_index] = None
+        self._layer_buffer[layer_index] = None
         self._resident[layer_index] = False
 
     @property
@@ -213,5 +246,11 @@ class AsyncLayerOffloader:
         return {
             "host_to_device_bytes": self.host_to_device_bytes,
             "device_to_host_bytes": self.device_to_host_bytes,
+            "prefetch_calls": self._prefetch_calls,
             "prefetched_layers": len(self.layers),
+            "merged_payload_bytes": sum(
+                payload.host.numel() for payload in self._payloads
+            ),
+            "gpu_buffer_slots": self._BUFFER_SLOTS,
+            "gpu_buffer_bytes": self._buffer_bytes * self._BUFFER_SLOTS,
         }
