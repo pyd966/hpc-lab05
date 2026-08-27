@@ -17,7 +17,7 @@ from hpc101_infer.quantization.types import (
 
 
 QUANTIZATION_CACHE_FILENAME = "quantization_cache.json"
-_QUANTIZATION_CACHE_VERSION = 2
+_QUANTIZATION_CACHE_VERSION = 3
 
 
 def _source_file_signatures(model_path: Path) -> list[dict[str, Any]]:
@@ -92,7 +92,7 @@ def _cache_artifact_signatures(output_dir: Path) -> list[dict[str, Any]]:
         "quantization_config.json",
         "model.safetensors.index.json",
     }
-    names.update(path.name for path in output_dir.glob("model-*.safetensors"))
+    names.update(path.name for path in output_dir.glob("model-*-of-*.safetensors"))
     signatures = []
     for name in sorted(names):
         path = output_dir / name
@@ -103,7 +103,6 @@ def _cache_artifact_signatures(output_dir: Path) -> list[dict[str, Any]]:
             {
                 "path": name,
                 "size": stat.st_size,
-                "mtime_ns": stat.st_mtime_ns,
                 "ctime_ns": stat.st_ctime_ns,
                 "inode": stat.st_ino,
             }
@@ -167,7 +166,6 @@ def load_quantization_cache(
             stat = path.stat()
             if (
                 stat.st_size != artifact["size"]
-                or stat.st_mtime_ns != artifact["mtime_ns"]
                 or stat.st_ctime_ns != artifact["ctime_ns"]
                 or stat.st_ino != artifact["inode"]
             ):

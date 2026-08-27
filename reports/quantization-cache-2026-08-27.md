@@ -8,11 +8,11 @@
 
 - `quantization_cache.json` 写入量化输出目录，与 packed INT4 分片、`manifest.json` 和 `quantization_config.json` 一起保存。
 - 缓存键包含源模型目录绝对路径、源目录下所有文件的路径/大小/mtime/ctime/inode、完整 `QuantizationConfig`、校准 token 的 shape/dtype/SHA-256、校准 micro batch、最大校准 token 数和最大分片大小。
-- 缓存元数据同时保存输出 `config.json`、manifest、量化配置、index 和所有 `model-*.safetensors` 的大小/mtime/ctime/inode。任一分片被替换、截断或缺失时自动失效。
+- 缓存元数据同时保存输出 `config.json`、manifest、量化配置、index 和所有最终 `model-*-of-*.safetensors` 分片的大小/ctime/inode。任一分片被替换、截断或缺失时自动失效。
 - 命中后通过 `QuantizedCheckpointSource` 读取 manifest，不读取权重 tensor；缓存损坏、格式版本不匹配或 checkpoint 不完整都会退回正常量化流程。
 - `quantize_checkpoint(..., reuse_cache=True)` 默认开启复用；CLI 的 `--force` 映射为 `reuse_cache=False`。
 
-缓存格式版本当前为 `2`。加入新影响量化结果的参数时，应同步加入缓存键并递增格式版本。
+缓存格式版本当前为 `3`。加入新影响量化结果的参数时，应同步加入缓存键并递增格式版本。
 
 ## 验证
 
