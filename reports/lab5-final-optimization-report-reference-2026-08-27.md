@@ -4,6 +4,9 @@
 
 最终实现基线：`a722d7e`
 
+> 更易读的重写版见 `reports/lab5-final-optimization-report-plain-2026-08-28.md`。
+> 当前文件保留完整技术细节、作业号和 profile 证据，适合作为数据附录。
+
 实验目标：在 1/7 张 H800、约 10 GiB 可见显存上，使公开 10 请求的正式
 `elapsed_s < 36 s`，同时保持 `delta_nll < 0.1`。
 
@@ -215,6 +218,29 @@ small 结果和显存结果在后文单独报告。
 首要指标，而是压缩权重、KV 和分配峰值，为完整负载、后续 batching 与权重常驻建立
 容量基础。
 
+### 4.0 先统一显存测量口径
+
+本节同时出现三类数字，必须分开解释：
+
+- **进程峰值 allocated** 是一次运行中 PyTorch 实际分配过的最高显存；
+- **KV 物理池容量** 是初始化时真实创建的 K/V tensor 与 metadata 大小；
+- **活跃 block 数** 只表示请求当前占用了 pool 中多少页。`release()` 把页面放回内部
+  free list，不等于把底层 tensor 归还 CUDA allocator。
+
+显存演进如下。表中 Offloading 与最终峰值使用的 workload 不同，因此不能把它们直接
+相减归因；组件级 KV 数字则使用相同模型配置，可以做严格 A/B。
+
+| 优化 | 测量对象 | 优化前 | 优化后 | 变化与结论 |
+| --- | --- | ---: | ---: | --- |
+| 异步 Offloading | 同一短输入的进程峰值 allocated | `8,252,107,776 B` | `2,673,564,672 B` | -67.60% |
+| Ring KV | batch 1、2048 token 的 KV tensor | `704,643,456 B` | `369,099,136 B` | -320 MiB，-47.62% |
+| 第一版 Paged+Ring | batch 1，与连续 Ring 比较 | `369,099,136 B` | `374,371,008 B` | **+5,271,872 B；没有省物理显存** |
+| 共享 Paged pool | batch 10 的 KV tensor+metadata | `3,743,710,080 B` | `2,982,443,904 B` | -761,266,176 B，约 -726 MiB |
+| 最终 44 层常驻 | full10 进程峰值 | - | allocated `9,742,262,784 B`；reserved `10,039,066,624 B` | 节省的 KV 空间被用于权重常驻，三次运行无告警 |
+
+这张表也说明显存优化不是单调追求更低的最终 allocated。最终配置主动把空出的容量用于
+44 层 MLP 常驻，使进程峰值高于 Continuous Batching 阶段，但显著减少 PCIe H2D。
+
 ### 4.1 使用 GPTQ W4A16 group64 压缩权重并控制量化误差
 
 **触发证据。** Gemma4-12B 的 BF16 权重本身已经超过 10 GiB，无法在本 MIG 实例上全量
@@ -308,14 +334,22 @@ token 最大误差为 `1.19e-7`。
 解决未对齐窗口最多跨 65 页的问题。第一版为了先验证功能，attention 前仍用
 `index_select` 把离散页收集成连续 K/V。
 
-**结果。** batch 1 的 Paged+Ring pool 为 `374,371,008 B`，相对不启用 Ring 的
-`704,692,608 B` 降低 46.875%。跨 3 页且发生 Ring page 复用的测试中最大误差
-`5.96e-8`。
+**这里必须区分管理粒度和物理容量。** 第一版的物理 tensor 仍按
+`max_batch_size * max_blocks_per_sequence` 一次性预分配。完成请求时，`release()` 只是
+把物理页号放回该 layer 的 free list，供后续请求复用；它不会缩小 K/V tensor，也不会
+把显存归还 PyTorch allocator。因此 Paged 本身这一轮没有降低进程峰值。
+
+**结果。** batch 1 的连续 Ring cache 为 `369,099,136 B`，Paged+Ring 为
+`374,371,008 B`，后者因 block table 和未对齐 Ring 的边界页反而多 `5,271,872 B`
+（约 5.03 MiB）。若与完全关闭 Ring 的 `704,692,608 B` 比，Paged+Ring 确实低
+46.875%，但这个差值主要来自上一节 Ring 对 40 个 sliding layer 的容量截断，不能归因
+于分页。跨 3 页且发生 Ring page 复用的测试中最大误差为 `5.96e-8`。
 
 **Profile 证据。** small 单请求 profile 的端到端时间从 Ring 版本的 `51.413 s` 变为
 `53.973 s`，慢 4.98%；Self CUDA 从 `54.762 s` 增到 `56.691 s`。这符合“先 gather
-再计算”的功能版会增加整理开销。它的价值是建立分页语义，真正的速度收益要等 attention
-kernel 直接读 block table，以及后续真正缩小物理 pool。
+再计算”的功能版会增加整理开销。它的价值是建立 block table、pool 内页面复用和请求
+完成释放的语义；真正的容量下降要等下一节缩小物理 pool，速度收益则要等 attention
+kernel 直接读取 block table。
 
 ### 4.5 使用跨请求共享的物理 KV block pool 缩小真实预留
 
@@ -333,8 +367,11 @@ PyTorch allocator。
 96/35 blocks 余量，而不是硬编码公开样本的精确长度。
 
 **结果。** 新 pool 含 metadata 为 `2,982,443,904 B`，释放 `761,266,176 B`，约
-726 MiB。该子项和权重常驻在同一最终提交中，没有独立 full10 A/B；可以证明容量按预期
-下降，但不能声称 17.555 秒的最终差值中有多少由 pool 自身直接贡献。
+726 MiB，即物理 KV 预留下降 20.33%。这才是 Paged 机制第一次转化为真实的 allocated
+容量下降。请求完成后的页面仍只归还内部 pool；之所以能省进程显存，是因为初始化时创建
+的 pool tensor 已经从 3.744 GB 缩到 2.982 GB。该子项和权重常驻在同一最终提交中，
+没有独立 full10 A/B；可以证明容量按预期下降，但不能声称 17.555 秒的最终差值中有多少
+由 pool 自身直接贡献。
 
 ### 4.6 使用生命周期 credit 与原子 reserve 保证小 pool 可用
 
@@ -348,6 +385,10 @@ Continuous Batching，而不是直接减少 kernel 时间。
 生命周期 credit。global 需求为 `ceil(max_length/16)`；sliding 需求上限为 65 页，因为
 1024 窗口在未对齐时可能跨 65 页。容量不足时暂停新 prefill、继续 active decode；请求
 完成后归还实际页和未来 credit。跨 48 层 reserve 先完整规划并检查，再原子提交。
+
+因此真正的因果链是：Paged 提供逻辑页和 free list；lifecycle credit 防止较小 pool
+过量接纳请求；原子 reserve 防止运行中半提交；请求完成 release 让页面在 pool 内复用；
+最后由较小的预分配物理 tensor 把这种复用能力转化为 726 MiB 的真实显存下降。
 
 **结果与证据。** 测试覆盖 1024/1025 边界、请求容量竞争、完成释放、slot refill 和
 跨层失败不产生部分分配。它没有独立性能数字，但消除了最终配置在运行中途 OOM 或页表
@@ -724,7 +765,7 @@ profile wall time 从 43.347 s 降到 26.382 s，下降 39.14%；其中 H2D Self
 | 异步 Offloading 第一版 | 显存降 67.6%，但 H2D/D2H 成为主热点 | Offload 是容量交换；随后去 D2H、合并 copy |
 | 双 buffer Offload | small 比无 Offload 慢 3.63% | 必须搬的 5.8 GB/遍历仍在；后续做 batching/residency |
 | Ring KV | 短请求慢约 2.7% | 请求未越过窗口，收益在容量而非短请求计算 |
-| 第一版 Paged KV | small 慢 4.98% | gather 连续 K/V 有额外开销；后续 kernel 直读页表 |
+| 第一版 Paged KV | 比连续 Ring 多约 5.03 MiB，small 慢 4.98% | 只建立页表与池内复用语义；后续缩小物理 pool 并让 kernel 直读页表 |
 | 初版 fused W4 prefill | TTFT 回退 15.8% | decode tile 不能代表大 M；后续单独优化 prefill tile |
 | FlashAttention | 相邻版本 full10 观察到 8.45% 下降，不可全部归因 | profile 显示 attention 已仅 0.24%，W4/H2D 才是主瓶颈 |
 | Continuous batch 10 | 只获得 3.29x，不是 10x | 自回归、六组 prefill、active batch 衰减和 W4/H2D 成本 |
